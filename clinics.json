@@ -1,0 +1,12 @@
+{
+   "hospital_central": {
+	"lolcli_url": "http://15.235.105.124:3001/LolcliApi/api" ,
+	"lolcli_token": "TE9MSU1TQTpMT0xGQVI5MDAwNUc=" ,
+	"lolcli_entidad": "000000001" ,
+	"evolution_instance": "evital" ,
+	"default_siscod": 1,
+	"staff_phone": "51999111222",
+	"support_email": "soporte@hospital.com" ,
+	"support_hours": "Lunes a Viernes, 8am - 6pm"
+	}
+}
