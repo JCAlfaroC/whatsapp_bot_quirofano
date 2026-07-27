@@ -158,16 +158,23 @@ def _call_lolcli(endpoint_key, payload, headers, timeout=8):
     Retorna (data, error_message). error_message es None si status == "success".
     """
     endpoint = LOLCLI_ENDPOINTS[endpoint_key]
+    url = f"{g.lolcli_url}/{endpoint}"
     try:
-        resp = requests.post(
-            f"{g.lolcli_url}/{endpoint}",
-            json=payload,
-            headers=headers,
-            timeout=timeout,
-        )
+        resp = requests.post(url, json=payload, headers=headers, timeout=timeout)
+    except requests.exceptions.RequestException as e:
+        # Falla de red/timeout: no hubo respuesta del servidor.
+        print(f"ERROR {endpoint}: sin respuesta de {url} -- {type(e).__name__}: {e}")
+        return None, "No pudimos conectar con el servidor en este momento. Intenta de nuevo en unos minutos."
+
+    print(f"INFO {endpoint}: POST {url} payload={payload} -> HTTP {resp.status_code}")
+    try:
         data = resp.json()
-    except (requests.exceptions.RequestException, ValueError) as e:
-        print(f"ERROR {endpoint}: {e}")
+    except ValueError:
+        # Hubo respuesta, pero no es JSON: típicamente un 404 (nombre de
+        # endpoint incorrecto -- los paths no están en la documentación) o una
+        # página de error del servidor. Se registra el cuerpo para poder
+        # distinguirlo de una caída de red.
+        print(f"ERROR {endpoint}: respuesta no-JSON (HTTP {resp.status_code}): {resp.text[:500]}")
         return None, "No pudimos conectar con el servidor en este momento. Intenta de nuevo en unos minutos."
 
     if data.get("status") == "error":
