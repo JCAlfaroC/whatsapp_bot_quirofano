@@ -1,6 +1,6 @@
 {
    "hospital_central": {
-	"lolcli_url": "http://15.235.105.124:3001/LolcliApi/api" ,
+	"lolcli_url": "http://15.235.105.124:3011/LolcliApi/api" ,
 	"lolcli_token": "TE9MSU1TQTpMT0xGQVI5MDAwNUc=" ,
 	"lolcli_entidad": "000000001" ,
 	"evolution_instance": "evital" ,

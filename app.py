@@ -869,12 +869,18 @@ load_clinics()
 threading.Thread(target=session_cleanup_task, daemon=True).start()
 
 if __name__ == "__main__":
-    # threaded=True permite atender a varios médicos en simultáneo (cada envío
-    # de WhatsApp duerme ~1.2s para no saturar la API); sin esto, el servidor
-    # de desarrollo de Flask procesa un webhook a la vez para TODOS los
-    # usuarios. Para el volumen real (300+ usuarios/día) esto sigue siendo un
-    # servidor de desarrollo: en producción usar un WSGI server (gunicorn,
-    # uwsgi) con múltiples workers, y mover user_sessions / los locks de
-    # sesión a un store compartido (p.ej. Redis) si se corre más de un worker,
-    # ya que hoy viven en memoria de un solo proceso.
-    app.run(host="0.0.0.0", port=int(os.getenv("PORT", 5000)), debug=False, threaded=True)
+    # waitress es un servidor WSGI de producción (a diferencia de app.run(),
+    # pensado solo para desarrollo). WAITRESS_THREADS controla cuántas
+    # peticiones puede atender en simultáneo; con un solo proceso,
+    # user_sessions / los locks de sesión / el dedup de mensajes siguen
+    # viviendo en memoria compartida entre esos hilos, así que no hace falta
+    # moverlos a un store externo (Redis) a menos que en el futuro se corra
+    # más de un proceso worker.
+    from waitress import serve
+
+    serve(
+        app,
+        host="0.0.0.0",
+        port=int(os.getenv("PORT", 5000)),
+        threads=int(os.getenv("WAITRESS_THREADS", 4)),
+    )
