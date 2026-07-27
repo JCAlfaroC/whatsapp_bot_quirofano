@@ -10,6 +10,7 @@ import os
 import threading
 import time
 import unicodedata
+from collections import deque
 from datetime import date, datetime, timedelta
 
 import requests
@@ -34,6 +35,21 @@ EVOLUTION_API_KEY = os.getenv("EVOLUTION_API_KEY")
 CLINICS = {}
 user_sessions = {}
 
+# Deduplicación de mensajes entrantes: Evolution/WhatsApp puede reintentar la
+# entrega del mismo webhook ante un timeout de red. Sin esto, un reintento
+# durante AWAITING_CONFIRMATION podría registrar la misma separación de
+# quirófano dos veces.
+_DEDUP_MAXLEN = 5000
+_dedup_lock = threading.Lock()
+_processed_msg_ids = set()
+_processed_msg_ids_order = deque()
+
+# Lock por sesión (clinic_id:telefono): serializa los mensajes de UN mismo
+# usuario para evitar condiciones de carrera sobre su sesión, sin bloquear a
+# los demás médicos que escriben al mismo tiempo.
+_session_locks_meta_lock = threading.Lock()
+_session_locks = {}
+
 INACTIVITY_REMINDER_PERIOD = 5 * 60
 SESSION_EXPIRATION_PERIOD = 15 * 60
 
@@ -43,10 +59,25 @@ MONTHS_ES = [
     "julio", "agosto", "septiembre", "octubre", "noviembre", "diciembre",
 ]
 
+# Duración en horas ofrecida al médico para cada reserva.
+DURATION_OPTIONS_HOURS = [1, 1.5, 2, 3, 4]
 
-# ---------------------------------------------------------------------------
+# NOTA: la documentación de la API ("Documentos APIS QUirofanos.docx") especifica
+# método (POST), content-type y los contratos de payload/respuesta de cada
+# endpoint, pero no el path literal. Los nombres abajo están inferidos de los
+# títulos de cada sección del documento y deben confirmarse con el equipo LOLCLI.
+LOLCLI_ENDPOINTS = {
+    "validar_medico": "ValidarMedico",              # 2.1 Validar Médico Quirófano
+    "listar_quirofanos": "ListarQuirofanos",         # 2.2 Listar Quirófanos
+    "listar_turnos": "ListarTurnosDisponibles",      # 2.3 Listar Turnos Disponibles
+    "registrar_separacion": "RegistrarSeparacionQuirofano",  # 2.4 Registrar Separación de Quirófano
+    "calcular_precio": "CalcularPrecioQuirofano",    # 2.5 Calcular Precio de Quirófano
+}
+
+
+# ------------------------------------------------------------------------
 # Utilities
-# ---------------------------------------------------------------------------
+# ------------------------------------------------------------------------
 
 def normalize_text(text):
     text = text.lower()
@@ -59,6 +90,11 @@ def normalize_text(text):
 
 def format_date_es(date_obj):
     return f"{DAYS_ES[date_obj.weekday()]}, {date_obj.day:02d} de {MONTHS_ES[date_obj.month]}"
+
+
+def format_duration_es(hours):
+    label = f"{hours:g}".replace(".", ",")
+    return f"{label} hora" + ("s" if hours != 1 else "")
 
 
 def next_business_days(n=14):
@@ -79,6 +115,64 @@ def load_clinics():
         print(f"INFO: {len(CLINICS)} clínica(s) cargada(s): {list(CLINICS.keys())}")
     except Exception as e:
         print(f"ERROR: No se pudo cargar clinics.json: {e}")
+
+
+def _mark_processed_if_new(msg_id):
+    """True si es la primera vez que se ve este id de mensaje de WhatsApp.
+
+    Sin id (payload inesperado) se deja pasar — no hay forma de deduplicar.
+    """
+    if not msg_id:
+        return True
+    with _dedup_lock:
+        if msg_id in _processed_msg_ids:
+            return False
+        _processed_msg_ids.add(msg_id)
+        _processed_msg_ids_order.append(msg_id)
+        if len(_processed_msg_ids_order) > _DEDUP_MAXLEN:
+            oldest = _processed_msg_ids_order.popleft()
+            _processed_msg_ids.discard(oldest)
+        return True
+
+
+def _get_session_lock(session_key):
+    with _session_locks_meta_lock:
+        lock = _session_locks.get(session_key)
+        if lock is None:
+            lock = threading.Lock()
+            _session_locks[session_key] = lock
+        return lock
+
+
+# ------------------------------------------------------------------------
+# LOLCLI API client
+# ------------------------------------------------------------------------
+
+def _call_lolcli(endpoint_key, payload, headers, timeout=8):
+    """POST a un endpoint LOLCLI.
+
+    Contrato (según Documentos APIS QUirofanos.docx, sección 3):
+    el bot debe interceptar siempre `status`; si es "error" (negocio o HTTP 500
+    unificado) se debe imprimir directamente el `message` devuelto al usuario.
+
+    Retorna (data, error_message). error_message es None si status == "success".
+    """
+    endpoint = LOLCLI_ENDPOINTS[endpoint_key]
+    try:
+        resp = requests.post(
+            f"{g.lolcli_url}/{endpoint}",
+            json=payload,
+            headers=headers,
+            timeout=timeout,
+        )
+        data = resp.json()
+    except (requests.exceptions.RequestException, ValueError) as e:
+        print(f"ERROR {endpoint}: {e}")
+        return None, "No pudimos conectar con el servidor en este momento. Intenta de nuevo en unos minutos."
+
+    if data.get("status") == "error":
+        return data, data.get("message", "Ocurrió un error inesperado.")
+    return data, None
 
 
 # ---------------------------------------------------------------------------
@@ -172,23 +266,6 @@ def send_list_message(phone, body, sections, instance=None, title="", button_tex
 # Menu helpers
 # ---------------------------------------------------------------------------
 
-def format_menu(title, items, key_id, key_name):
-    """Text fallback menu — returns (text, formatted_items)."""
-    menu_text = f"{title}\n\n"
-    formatted_items = []
-    for i, item in enumerate(items, 1):
-        display_name = item.get(key_name, "")
-        if key_id == "fecha_api":
-            try:
-                display_name = format_date_es(datetime.strptime(item.get(key_id, ""), "%Y%m%d"))
-            except (ValueError, TypeError):
-                pass
-        menu_text += f"*{i}.* {display_name}\n"
-        formatted_items.append({"id": i, "data": item})
-    menu_text += "\n_Escribe el número de tu elección o *'retroceder'* / *'salir'*._"
-    return menu_text, formatted_items
-
-
 def process_user_choice(user_input, options, key_name=None):
     try:
         idx = int(user_input) - 1
@@ -218,8 +295,8 @@ def show_main_menu(phone, session, instance=None):
             "title": "Opciones",
             "rows": [
                 {"id": "menu_nueva",     "title": "🗓️ Nueva reserva",     "description": "Reservar un quirófano"},
-                {"id": "menu_consultar", "title": "📋 Mis reservas",       "description": "Ver tus reservas activas"},
-                {"id": "menu_cancelar",  "title": "❌ Cancelar reserva",   "description": "Anular una reserva existente"},
+                {"id": "menu_consultar", "title": "📋 Mis reservas",       "description": "Próximamente disponible"},
+                {"id": "menu_cancelar",  "title": "❌ Cancelar reserva",   "description": "Próximamente disponible"},
                 {"id": "menu_asesor",    "title": "👤 Hablar con un asesor", "description": "Conectar con personal de soporte"},
             ],
         }],
@@ -289,12 +366,18 @@ def webhook_handler(clinic_id):
 
     data = request.json
     try:
-        sender = data["data"]["key"]["remoteJid"].split("@")[0]
-        if data["data"]["key"]["fromMe"]:
+        key = data["data"]["key"]
+        sender = key["remoteJid"].split("@")[0]
+        if key["fromMe"]:
             return jsonify({"status": "ignored_from_me"}), 200
         msg = data["data"]["message"]
+        msg_id = key.get("id")
     except (KeyError, TypeError):
         return jsonify({"status": "ignored_format"}), 200
+
+    if not _mark_processed_if_new(msg_id):
+        print(f"INFO: mensaje duplicado ignorado (id={msg_id}, sender={sender})")
+        return jsonify({"status": "duplicate_ignored"}), 200
 
     # Normalize input — support plain text, button replies, and list replies
     message_text = (
@@ -315,16 +398,24 @@ def webhook_handler(clinic_id):
     }
 
     session_key = f"{clinic_id}:{sender}"
+    phone = sender
+    print(f"[{clinic_id}] {sender}: '{message_text}' | id={selected_id}")
+
+    # Serializa los mensajes de UN mismo usuario (evita condiciones de carrera
+    # sobre su sesión) sin bloquear a otros médicos que escriben al mismo
+    # tiempo — el servidor corre con threaded=True para atender ~300 usuarios/día.
+    with _get_session_lock(session_key):
+        return _handle_message(session_key, phone, message_text, selected_id, config, lolcli_headers)
+
+
+def _handle_message(session_key, phone, message_text, selected_id, config, lolcli_headers):
     session = user_sessions.get(session_key, {"state": "START"})
-    session["sender"] = sender
-    session["clinic_id"] = clinic_id
+    session["sender"] = phone
+    session["clinic_id"] = g.clinic_id
     session["evolution_instance"] = g.evolution_instance
     session["last_interaction_time"] = time.time()
     if session.get("reminder_sent"):
         session["reminder_sent"] = False
-
-    phone = sender
-    print(f"[{clinic_id}] {sender}: '{message_text}' | id={selected_id}")
 
     # --- Global commands ---
     normalized = normalize_text(message_text)
@@ -383,50 +474,56 @@ def webhook_handler(clinic_id):
         if not medcod:
             send_whatsapp_message(phone, "⚠️ Por favor, ingresa tu código de médico.")
         else:
-            try:
-                # TODO: confirm endpoint name with LOLCLI team — try ValidarMedico first
-                resp = requests.post(
-                    f"{g.lolcli_url}/ValidarMedico",
-                    json={"medcod": medcod},
-                    headers=lolcli_headers,
-                    timeout=8,
-                )
-                if resp.ok:
-                    data_med = resp.json()
-                    medicos = data_med.get("medicos") or data_med.get("medico") or []
-                    if isinstance(medicos, dict):
-                        medicos = [medicos]
-                    if medicos:
-                        medico = medicos[0]
-                        session["medcod"] = medcod
-                        session["mednam"] = medico.get("mednam") or medico.get("nombre") or medcod
-                        session.setdefault("history", []).append("AWAITING_AUTH")
-                        send_whatsapp_message(phone, f"✅ ¡Hola, {session['mednam']}!")
-                        show_main_menu(phone, session)
-                    else:
-                        send_whatsapp_message(
-                            phone,
-                            "❌ No encontramos ese código de médico. Verifica e inténtalo de nuevo.",
-                        )
+            resp_data, err = _call_lolcli("validar_medico", {"medcod": medcod}, lolcli_headers)
+            if err:
+                send_whatsapp_message(phone, f"❌ {err}")
+            else:
+                medicos = resp_data.get("medico", [])
+                if isinstance(medicos, dict):
+                    medicos = [medicos]
+                medicos = [m for m in medicos if m.get("valido", "S") == "S"]
+                if medicos:
+                    medico = medicos[0]
+                    session["medcod"] = medico.get("medcod", medcod)
+                    session["mednam"] = medico.get("mednam", medcod)
+                    session["regesp"] = medico.get("regesp", "")
+                    session.setdefault("history", []).append("AWAITING_AUTH")
+                    send_whatsapp_message(phone, f"✅ ¡Hola, {session['mednam']}!")
+                    show_main_menu(phone, session)
                 else:
-                    raise Exception(f"HTTP {resp.status_code}")
-            except Exception as e:
-                print(f"ERROR ValidarMedico: {e}")
-                send_whatsapp_message(
-                    phone,
-                    "😔 No pudimos verificar tu código en este momento. Intenta de nuevo o escribe *'ayuda'*. 🙏",
-                )
+                    send_whatsapp_message(
+                        phone,
+                        "❌ No encontramos ese código de médico. Verifica e inténtalo de nuevo.",
+                    )
 
     elif state == "AWAITING_MAIN_MENU":
         choice = selected_id or normalized
         if choice in ["menu_nueva", "1", "nueva reserva", "nueva", "reservar"]:
             _start_booking_flow(session, phone, lolcli_headers)
-        elif choice in ["menu_consultar", "2", "mis reservas", "consultar"]:
-            _start_consult_flow(session, phone, lolcli_headers)
-        elif choice in ["menu_cancelar", "3", "cancelar reserva", "anular"]:
-            _start_cancel_flow(session, phone, lolcli_headers)
+        elif choice in ["menu_consultar", "2", "mis reservas", "consultar",
+                         "menu_cancelar", "3", "cancelar reserva", "anular"]:
+            send_whatsapp_message(
+                phone,
+                "🚧 Esta función estará disponible próximamente.\n"
+                "Por ahora, para consultar o cancelar una reserva contacta a nuestro equipo de soporte "
+                "escribiendo *'asesor'*.",
+            )
+            send_whatsapp_message(phone, "Escribe *'continuar'* para volver al menú.")
+            session["state"] = "AWAITING_POST_FLOW"
         else:
             send_whatsapp_message(phone, "❓ Elige una opción del menú. 😊")
+
+    elif state == "AWAITING_QUIROFANO":
+        selected = _resolve_selection(message_text, selected_id, session)
+        if selected:
+            session.setdefault("history", []).append("AWAITING_QUIROFANO")
+            session["quicod"] = selected["quicod"]
+            session["quidel"] = selected["quidel"]
+            session["quidec"] = selected["quidec"]
+            session["prisal_hora"] = selected["prisal_hora"]
+            _ask_date(session, phone, lolcli_headers)
+        else:
+            send_whatsapp_message(phone, "❓ No reconocí ese quirófano. Elige uno de la lista.")
 
     elif state == "AWAITING_DATE":
         selected = _resolve_selection(message_text, selected_id, session)
@@ -434,34 +531,34 @@ def webhook_handler(clinic_id):
             session.setdefault("history", []).append("AWAITING_DATE")
             session["fecha_api"] = selected["fecha_api"]
             session["fecha_user"] = selected["fecha_user"]
-            _ask_quirofano(session, phone, lolcli_headers)
-        else:
-            send_whatsapp_message(phone, "❓ No reconocí esa fecha. Elige una de la lista.")
-
-    elif state == "AWAITING_QUIROFANO":
-        selected = _resolve_selection(message_text, selected_id, session)
-        if selected:
-            session.setdefault("history", []).append("AWAITING_QUIROFANO")
-            session["quicod"] = selected["quicod"]
-            session["quinam"] = selected["quinam"]
             _ask_time_block(session, phone, lolcli_headers)
         else:
-            send_whatsapp_message(phone, "❓ No reconocí ese quirófano. Elige uno de la lista.")
+            send_whatsapp_message(phone, "❓ No reconocí esa fecha. Elige una de la lista.")
 
     elif state == "AWAITING_TIME_BLOCK":
         selected = _resolve_selection(message_text, selected_id, session)
         if selected:
             session.setdefault("history", []).append("AWAITING_TIME_BLOCK")
             session["hora_api"] = selected["hora_api"]
-            session["hora_user"] = selected["hora_user"]
-            send_whatsapp_message(
-                phone,
-                "📋 Opcionalmente, indica el nombre del *procedimiento o cirugía* a realizar.\n"
-                "_Escribe el nombre o *'omitir'* para continuar sin especificarlo._",
-            )
-            session["state"] = "AWAITING_PROCEDURE"
+            session["hora_user"] = selected["hora_api"]
+            _ask_duration(session, phone, lolcli_headers)
         else:
             send_whatsapp_message(phone, "❓ No reconocí ese horario. Elige uno de la lista.")
+
+    elif state == "AWAITING_DURATION":
+        selected = _resolve_selection(message_text, selected_id, session)
+        if selected:
+            session.setdefault("history", []).append("AWAITING_DURATION")
+            duracion = selected["duracion_horas"]
+            horini_dt = datetime.strptime(f"{session['fecha_api']}T{session['hora_api']}", "%Y-%m-%dT%H:%M")
+            horfin_dt = horini_dt + timedelta(hours=duracion)
+            session["horini"] = horini_dt.strftime("%Y-%m-%dT%H:%M:%S")
+            session["horfin"] = horfin_dt.strftime("%Y-%m-%dT%H:%M:%S")
+            session["hora_fin_user"] = horfin_dt.strftime("%H:%M")
+            session["duracion_horas"] = duracion
+            _calcular_precio_y_continuar(session, phone, lolcli_headers)
+        else:
+            send_whatsapp_message(phone, "❓ No reconocí esa opción. Elige una de la lista.")
 
     elif state == "AWAITING_PROCEDURE":
         if normalize_text(message_text) == "omitir":
@@ -486,29 +583,6 @@ def webhook_handler(clinic_id):
                 [{"id": "conf_si", "title": "✅ Sí, confirmar"},
                  {"id": "conf_no", "title": "↩️ Retroceder"}],
             )
-
-    elif state == "AWAITING_RESERVATION_TO_CANCEL":
-        selected = _resolve_selection(message_text, selected_id, session)
-        if selected:
-            session["resid_to_cancel"] = selected.get("resid") or selected.get("id", "")
-            session["res_summary"] = selected.get("summary", "")
-            send_button_message(
-                phone,
-                f"¿Confirmas la cancelación de esta reserva?\n\n{session['res_summary']}",
-                [{"id": "cancel_si", "title": "✅ Sí, cancelar"},
-                 {"id": "cancel_no", "title": "↩️ No, volver"}],
-            )
-            session["state"] = "AWAITING_CANCEL_CONFIRMATION"
-        else:
-            send_whatsapp_message(phone, "❓ No reconocí esa opción. Elige una de la lista.")
-
-    elif state == "AWAITING_CANCEL_CONFIRMATION":
-        choice = selected_id or normalized
-        if choice in ["cancel_si", "si", "sí"]:
-            _confirm_cancellation(session, phone, lolcli_headers)
-        else:
-            send_whatsapp_message(phone, "↩️ Cancelación abortada. Escribe *'salir'* o vuelve al menú con *'hola'*.")
-            session["state"] = "AWAITING_POST_FLOW"
 
     elif state == "AWAITING_POST_FLOW":
         if normalized in ["continuar", "continue", "hola", "menu", "menú"]:
@@ -541,11 +615,49 @@ def _resolve_selection(message_text, selected_id, session):
 
 
 def _start_booking_flow(session, phone, lolcli_headers):
+    resp_data, err = _call_lolcli("listar_quirofanos", {"xxsiscod": g.default_siscod}, lolcli_headers)
+    if err:
+        send_whatsapp_message(phone, f"❌ {err}")
+        return
+
+    quirofanos = resp_data.get("quirofanos", [])
+    if not quirofanos:
+        send_whatsapp_message(phone, "😔 No hay quirófanos disponibles en este momento.")
+        send_whatsapp_message(phone, "Escribe *'continuar'* para volver al menú.")
+        session["state"] = "AWAITING_POST_FLOW"
+        return
+
+    rows = []
+    formatted = []
+    for i, q in enumerate(quirofanos):
+        quicod = q.get("quicod", "")
+        quidel = q.get("quidel") or f"Quirófano {i+1}"
+        quidec = q.get("quidec", "")
+        prisal_hora = float(q.get("prisal_hora") or 0)
+        row_id = f"qui_{quicod}"
+        rows.append({"id": row_id, "title": quidel, "description": f"{quidec} — S/ {prisal_hora:.2f}/hora"})
+        formatted.append({
+            "id": i + 1,
+            "data": {"_id": row_id, "quicod": quicod, "quidel": quidel, "quidec": quidec, "prisal_hora": prisal_hora},
+        })
+
+    session["options"] = formatted
+    session["state"] = "AWAITING_QUIROFANO"
+    send_list_message(
+        phone,
+        "Selecciona el *quirófano* que deseas reservar:",
+        sections=[{"title": "Quirófanos disponibles", "rows": rows}],
+        title="Nueva reserva de quirófano",
+        button_text="Ver quirófanos",
+    )
+
+
+def _ask_date(session, phone, lolcli_headers):
     days = next_business_days(14)
     rows = []
     formatted = []
     for i, d in enumerate(days):
-        fecha_api = d.strftime("%Y%m%d")
+        fecha_api = d.strftime("%Y-%m-%d")
         fecha_user = format_date_es(d)
         row_id = f"date_{fecha_api}"
         rows.append({"id": row_id, "title": fecha_user, "description": ""})
@@ -554,109 +666,118 @@ def _start_booking_flow(session, phone, lolcli_headers):
     session["state"] = "AWAITING_DATE"
     send_list_message(
         phone,
-        "Selecciona la *fecha* para la reserva:",
+        f"Selecciona la *fecha* para *{session['quidel']}*:",
         sections=[{"title": "Fechas disponibles", "rows": rows}],
         title="Nueva reserva de quirófano",
         button_text="Ver fechas",
     )
 
 
-def _ask_quirofano(session, phone, lolcli_headers):
-    try:
-        # TODO: confirm endpoint name with LOLCLI team
-        resp = requests.post(
-            f"{g.lolcli_url}/ListaQuirofanos",
-            json={"siscod": g.default_siscod, "fecha": session["fecha_api"]},
-            headers=lolcli_headers,
-            timeout=8,
-        )
-        quirofanos = resp.json().get("quirofanos", []) if resp.ok else []
-    except Exception as e:
-        print(f"ERROR ListaQuirofanos: {e}")
-        quirofanos = []
-
-    if not quirofanos:
-        send_whatsapp_message(
-            phone,
-            "😔 No hay quirófanos disponibles para esa fecha. Escribe *'retroceder'* para elegir otra.",
-        )
-        return
-
-    rows = []
-    formatted = []
-    for i, q in enumerate(quirofanos):
-        quicod = q.get("quicod") or q.get("id", str(i))
-        quinam = q.get("quinam") or q.get("nombre") or f"Quirófano {i+1}"
-        desc = q.get("descripcion") or q.get("tipo") or ""
-        row_id = f"qui_{quicod}"
-        rows.append({"id": row_id, "title": quinam, "description": desc})
-        formatted.append({"id": i + 1, "data": {"_id": row_id, "quicod": quicod, "quinam": quinam}})
-
-    session["options"] = formatted
-    session["state"] = "AWAITING_QUIROFANO"
-    send_list_message(
-        phone,
-        f"Quirófanos disponibles para *{session['fecha_user']}*:",
-        sections=[{"title": "Quirófanos", "rows": rows}],
-        button_text="Ver quirófanos",
-    )
-
-
 def _ask_time_block(session, phone, lolcli_headers):
-    try:
-        # TODO: confirm endpoint name with LOLCLI team
-        resp = requests.post(
-            f"{g.lolcli_url}/ListaHorasQuirofano",
-            json={"quicod": session["quicod"], "fecha": session["fecha_api"]},
-            headers=lolcli_headers,
-            timeout=8,
-        )
-        horarios = resp.json().get("horarios", []) if resp.ok else []
-    except Exception as e:
-        print(f"ERROR ListaHorasQuirofano: {e}")
-        horarios = []
+    fecha_ini = session["fecha_api"]
+    fecha_fin = (datetime.strptime(fecha_ini, "%Y-%m-%d") + timedelta(days=1)).strftime("%Y-%m-%d")
+    payload = {
+        "xxsiscod": g.default_siscod,
+        "xxfechaini": fecha_ini,
+        "xxfechafin": fecha_fin,
+        "xxquicod": session["quicod"],
+    }
+    resp_data, err = _call_lolcli("listar_turnos", payload, lolcli_headers)
+    if err:
+        send_whatsapp_message(phone, f"❌ {err}")
+        return
 
-    if not horarios:
+    # Se filtra también por fecha exacta, no solo por 'disponible': si el rango
+    # [xxfechaini, xxfechafin) resulta inclusivo en el backend, podría devolver
+    # turnos del día siguiente y duplicar horas (p.ej. dos "08:00"), arriesgando
+    # que el médico reserve sin querer el día equivocado.
+    turnos = [
+        t for t in resp_data.get("turnos", [])
+        if t.get("disponible") == "S" and str(t.get("fecha", "")).startswith(fecha_ini)
+    ]
+    if not turnos:
         send_whatsapp_message(
             phone,
-            "😔 No hay horarios disponibles para ese quirófano. Escribe *'retroceder'* para elegir otro.",
+            "😔 No hay horarios disponibles para ese quirófano en esta fecha. Escribe *'retroceder'* para elegir otra fecha.",
         )
         return
 
     rows = []
     formatted = []
-    for i, h in enumerate(horarios):
-        hora_raw = h.get("hora") or h.get("horinicio") or ""
-        hora_fin = h.get("horafin") or ""
-        try:
-            hora_user = datetime.strptime(hora_raw, "%H%M").strftime("%H:%M")
-            label = f"{hora_user}" + (f" – {datetime.strptime(hora_fin, '%H%M').strftime('%H:%M')}" if hora_fin else "")
-        except (ValueError, TypeError):
-            hora_user = hora_raw
-            label = hora_raw
-        row_id = f"hora_{hora_raw}_{i}"
-        rows.append({"id": row_id, "title": label, "description": h.get("descripcion", "")})
-        formatted.append({"id": i + 1, "data": {"_id": row_id, "hora_api": hora_raw, "hora_user": hora_user}})
+    for i, t in enumerate(turnos):
+        hora = t.get("hora", "")
+        row_id = f"hora_{hora}_{i}"
+        rows.append({"id": row_id, "title": hora, "description": ""})
+        formatted.append({"id": i + 1, "data": {"_id": row_id, "hora_api": hora}})
 
     session["options"] = formatted
     session["state"] = "AWAITING_TIME_BLOCK"
     send_list_message(
         phone,
-        f"Horarios disponibles en *{session['quinam']}*:",
-        sections=[{"title": "Bloques horarios", "rows": rows}],
+        f"Horarios disponibles en *{session['quidel']}* para *{session['fecha_user']}*:",
+        sections=[{"title": "Horarios", "rows": rows}],
         button_text="Ver horarios",
     )
 
 
+def _ask_duration(session, phone, lolcli_headers):
+    rows = []
+    formatted = []
+    for i, h in enumerate(DURATION_OPTIONS_HOURS):
+        row_id = f"dur_{h}"
+        rows.append({"id": row_id, "title": format_duration_es(h), "description": ""})
+        formatted.append({"id": i + 1, "data": {"_id": row_id, "duracion_horas": h}})
+    session["options"] = formatted
+    session["state"] = "AWAITING_DURATION"
+    send_list_message(
+        phone,
+        f"¿Cuánto tiempo necesitas el quirófano a partir de las *{session['hora_user']}*?",
+        sections=[{"title": "Duración", "rows": rows}],
+        button_text="Ver opciones",
+    )
+
+
+def _calcular_precio_y_continuar(session, phone, lolcli_headers):
+    payload = {
+        "xxquicod": session["quicod"],
+        "xxfechaini": session["horini"],
+        "xxfechafin": session["horfin"],
+        "xxprisal_hora": session["prisal_hora"],
+    }
+    resp_data, err = _call_lolcli("calcular_precio", payload, lolcli_headers, timeout=10)
+    if err:
+        send_whatsapp_message(phone, f"❌ {err}")
+        return
+
+    cotizaciones = resp_data.get("cotizacion", [])
+    if not cotizaciones:
+        send_whatsapp_message(phone, "😔 No pudimos calcular el precio. Intenta de nuevo.")
+        return
+
+    cot = cotizaciones[0]
+    session["precio_total"] = float(cot.get("precio_total") or 0)
+    session["horas_cobradas"] = float(cot.get("horas") or session["duracion_horas"])
+
+    send_whatsapp_message(
+        phone,
+        "📋 Opcionalmente, indica el nombre del *procedimiento o cirugía* a realizar.\n"
+        "_Escribe el nombre o *'omitir'* para continuar sin especificarlo._",
+    )
+    session["state"] = "AWAITING_PROCEDURE"
+
+
 def _show_booking_summary(session, phone):
     proc = session.get("procedimiento") or "No especificado"
+    precio = session.get("precio_total", 0)
     summary = (
         f"📋 *Resumen de la reserva:*\n\n"
         f"👨‍⚕️ *Médico:* {session.get('mednam', '')}\n"
-        f"🏥 *Quirófano:* {session.get('quinam', '')}\n"
+        f"🏥 *Quirófano:* {session.get('quidel', '')}\n"
+        f"📍 *Ubicación:* {session.get('quidec', '')}\n"
         f"🗓️ *Fecha:* {session.get('fecha_user', '')}\n"
-        f"⏰ *Hora:* {session.get('hora_user', '')}\n"
-        f"🔬 *Procedimiento:* {proc}\n\n"
+        f"⏰ *Horario:* {session.get('hora_user', '')} – {session.get('hora_fin_user', '')}\n"
+        f"🔬 *Procedimiento:* {proc}\n"
+        f"💰 *Total a pagar:* S/ {precio:.2f}\n\n"
         f"¿Confirmas la reserva?"
     )
     send_button_message(
@@ -669,151 +790,35 @@ def _show_booking_summary(session, phone):
 
 
 def _confirm_booking(session, phone, lolcli_headers):
-    try:
-        fecref = datetime.strptime(
-            session["fecha_api"] + session["hora_api"], "%Y%m%d%H%M"
-        ).strftime("%d-%m-%Y %H:%M")
-
-        payload = {
-            "quicod": session["quicod"],
-            "medcod": session["medcod"],
-            "siscod": g.default_siscod,
-            "fecref": fecref,
-            "procedimiento": session.get("procedimiento", ""),
-        }
-        # TODO: confirm endpoint name with LOLCLI team
-        resp = requests.post(
-            f"{g.lolcli_url}/RegistroReservaQuirofano",
-            json=payload,
-            headers=lolcli_headers,
-            timeout=10,
-        )
-        result = resp.json()
-        if resp.ok and result.get("status") == "success":
-            resid = result.get("resid") or result.get("id") or "—"
-            session["resid"] = resid
-            send_whatsapp_message(
-                phone,
-                f"✅ *¡Reserva confirmada!*\n\n"
-                f"🆔 *N° de reserva:* {resid}\n"
-                f"🏥 *Quirófano:* {session['quinam']}\n"
-                f"🗓️ *Fecha:* {session['fecha_user']}\n"
-                f"⏰ *Hora:* {session['hora_user']}\n\n"
-                f"¡Hasta pronto! 🙏",
-            )
-            send_whatsapp_message(
-                phone,
-                "Escribe *'continuar'* para hacer otra reserva o *'salir'* para cerrar la sesión.",
-            )
-            session["state"] = "AWAITING_POST_FLOW"
-        else:
-            msg = result.get("message", "error desconocido")
-            send_whatsapp_message(phone, f"❌ No se pudo registrar la reserva: {msg}. Intenta de nuevo.")
-    except Exception as e:
-        print(f"ERROR _confirm_booking: {e}")
-        send_whatsapp_message(phone, "😔 Ocurrió un error al registrar la reserva. Intenta de nuevo. 🙏")
-
-
-def _start_consult_flow(session, phone, lolcli_headers):
-    try:
-        # TODO: confirm endpoint name with LOLCLI team
-        resp = requests.post(
-            f"{g.lolcli_url}/ListaReservasQuirofano",
-            json={"medcod": session["medcod"]},
-            headers=lolcli_headers,
-            timeout=8,
-        )
-        reservas = resp.json().get("reservas", []) if resp.ok else []
-    except Exception as e:
-        print(f"ERROR ListaReservasQuirofano: {e}")
-        reservas = []
-
-    if not reservas:
-        send_whatsapp_message(phone, "📋 No tienes reservas activas en este momento. 😊")
-        send_whatsapp_message(phone, "Escribe *'continuar'* para volver al menú.")
-        session["state"] = "AWAITING_POST_FLOW"
+    payload = {
+        "xxsiscod": g.default_siscod,
+        "xxquicod": session["quicod"],
+        "xxsepdat": datetime.now().strftime("%Y-%m-%dT%H:%M:%S"),
+        "xxhorini": session["horini"],
+        "xxhorfin": session["horfin"],
+        "xxmedcod": session["medcod"],
+    }
+    resp_data, err = _call_lolcli("registrar_separacion", payload, lolcli_headers, timeout=10)
+    if err:
+        send_whatsapp_message(phone, f"❌ No se pudo registrar la reserva: {err}. Intenta de nuevo.")
         return
 
-    msg = "📋 *Tus reservas activas:*\n\n"
-    for i, r in enumerate(reservas, 1):
-        fecha = r.get("fecha") or r.get("fecref") or ""
-        hora = r.get("hora") or ""
-        quinam = r.get("quinam") or r.get("quirofano") or ""
-        proc = r.get("procedimiento") or ""
-        msg += (
-            f"*{i}.* 🏥 {quinam}\n"
-            f"   🗓️ {fecha}  ⏰ {hora}\n"
-            f"   🔬 {proc}\n\n"
-        )
-    msg += "_Escribe *'continuar'* para volver al menú._"
-    send_whatsapp_message(phone, msg)
-    session["state"] = "AWAITING_POST_FLOW"
-
-
-def _start_cancel_flow(session, phone, lolcli_headers):
-    try:
-        # TODO: confirm endpoint name with LOLCLI team
-        resp = requests.post(
-            f"{g.lolcli_url}/ListaReservasQuirofano",
-            json={"medcod": session["medcod"]},
-            headers=lolcli_headers,
-            timeout=8,
-        )
-        reservas = resp.json().get("reservas", []) if resp.ok else []
-    except Exception as e:
-        print(f"ERROR ListaReservasQuirofano (cancel): {e}")
-        reservas = []
-
-    if not reservas:
-        send_whatsapp_message(phone, "📋 No tienes reservas activas para cancelar. 😊")
-        send_whatsapp_message(phone, "Escribe *'continuar'* para volver al menú.")
-        session["state"] = "AWAITING_POST_FLOW"
-        return
-
-    rows = []
-    formatted = []
-    for i, r in enumerate(reservas):
-        resid = r.get("resid") or r.get("id") or str(i)
-        quinam = r.get("quinam") or r.get("quirofano") or f"Reserva {i+1}"
-        fecha = r.get("fecha") or r.get("fecref") or ""
-        hora = r.get("hora") or ""
-        row_id = f"res_{resid}"
-        label = f"{quinam} — {fecha} {hora}".strip()
-        rows.append({"id": row_id, "title": quinam, "description": f"{fecha} {hora}".strip()})
-        formatted.append({
-            "id": i + 1,
-            "data": {"_id": row_id, "resid": resid, "quinam": quinam, "summary": label},
-        })
-
-    session["options"] = formatted
-    session["state"] = "AWAITING_RESERVATION_TO_CANCEL"
-    send_list_message(
+    invnum = resp_data.get("invnum", "—")
+    session["invnum"] = invnum
+    send_whatsapp_message(
         phone,
-        "¿Cuál reserva deseas cancelar?",
-        sections=[{"title": "Reservas activas", "rows": rows}],
-        button_text="Ver reservas",
+        f"✅ *¡Reserva confirmada!*\n\n"
+        f"🆔 *N° de intervención:* {invnum}\n"
+        f"🏥 *Quirófano:* {session.get('quidel', '')}\n"
+        f"🗓️ *Fecha:* {session.get('fecha_user', '')}\n"
+        f"⏰ *Horario:* {session.get('hora_user', '')} – {session.get('hora_fin_user', '')}\n"
+        f"💰 *Total:* S/ {session.get('precio_total', 0):.2f}\n\n"
+        f"¡Hasta pronto! 🙏",
     )
-
-
-def _confirm_cancellation(session, phone, lolcli_headers):
-    try:
-        # TODO: confirm endpoint name with LOLCLI team
-        resp = requests.post(
-            f"{g.lolcli_url}/AnularReservaQuirofano",
-            json={"resid": session["resid_to_cancel"]},
-            headers=lolcli_headers,
-            timeout=10,
-        )
-        result = resp.json()
-        if resp.ok and result.get("status") == "success":
-            send_whatsapp_message(phone, "✅ Reserva cancelada exitosamente. 👋")
-        else:
-            msg = result.get("message", "error desconocido")
-            send_whatsapp_message(phone, f"❌ No se pudo cancelar: {msg}.")
-    except Exception as e:
-        print(f"ERROR _confirm_cancellation: {e}")
-        send_whatsapp_message(phone, "😔 Error al cancelar la reserva. Intenta de nuevo. 🙏")
-    send_whatsapp_message(phone, "Escribe *'continuar'* para volver al menú.")
+    send_whatsapp_message(
+        phone,
+        "Escribe *'continuar'* para hacer otra reserva o *'salir'* para cerrar la sesión.",
+    )
     session["state"] = "AWAITING_POST_FLOW"
 
 
@@ -841,12 +846,14 @@ def _trigger_human_handoff(session, phone, config, lolcli_headers):
 
 
 def _replay_state(state, session, phone, lolcli_headers):
-    if state == "AWAITING_DATE":
+    if state == "AWAITING_QUIROFANO":
         _start_booking_flow(session, phone, lolcli_headers)
-    elif state == "AWAITING_QUIROFANO":
-        _ask_quirofano(session, phone, lolcli_headers)
+    elif state == "AWAITING_DATE":
+        _ask_date(session, phone, lolcli_headers)
     elif state == "AWAITING_TIME_BLOCK":
         _ask_time_block(session, phone, lolcli_headers)
+    elif state == "AWAITING_DURATION":
+        _ask_duration(session, phone, lolcli_headers)
     elif state == "AWAITING_MAIN_MENU":
         show_main_menu(phone, session)
     else:
@@ -862,5 +869,12 @@ load_clinics()
 threading.Thread(target=session_cleanup_task, daemon=True).start()
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=int(os.getenv("PORT", 5000)), debug=False)
-
+    # threaded=True permite atender a varios médicos en simultáneo (cada envío
+    # de WhatsApp duerme ~1.2s para no saturar la API); sin esto, el servidor
+    # de desarrollo de Flask procesa un webhook a la vez para TODOS los
+    # usuarios. Para el volumen real (300+ usuarios/día) esto sigue siendo un
+    # servidor de desarrollo: en producción usar un WSGI server (gunicorn,
+    # uwsgi) con múltiples workers, y mover user_sessions / los locks de
+    # sesión a un store compartido (p.ej. Redis) si se corre más de un worker,
+    # ya que hoy viven en memoria de un solo proceso.
+    app.run(host="0.0.0.0", port=int(os.getenv("PORT", 5000)), debug=False, threaded=True)
