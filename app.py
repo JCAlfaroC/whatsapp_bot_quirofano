@@ -878,9 +878,12 @@ if __name__ == "__main__":
     # más de un proceso worker.
     from waitress import serve
 
+    _port = int(os.getenv("PORT", 5000))
+    _threads = int(os.getenv("WAITRESS_THREADS", 4))
+    print(f"INFO: Iniciando servidor waitress en http://0.0.0.0:{_port} ({_threads} hilos)")
     serve(
         app,
         host="0.0.0.0",
-        port=int(os.getenv("PORT", 5000)),
-        threads=int(os.getenv("WAITRESS_THREADS", 4)),
+        port=_port,
+        threads=_threads,
     )
