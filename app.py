@@ -32,6 +32,15 @@ app = Flask(__name__)
 EVOLUTION_API_URL = os.getenv("EVOLUTION_API_URL", "").rstrip("/")
 EVOLUTION_API_KEY = os.getenv("EVOLUTION_API_KEY")
 
+# DEMO_MODE=1 sustituye las 4 llamadas de quirófanos (listar, turnos, precio,
+# separación) por respuestas simuladas con la MISMA estructura que documenta
+# "Documentos APIS QUirofanos.docx", porque esos endpoints todavía no están
+# desplegados en LOLCLI (responden 404 en :3001 y :3011 con cualquier nombre).
+# La validación del médico NO se simula: se resuelve contra el padrón real
+# obtenido de ListaMedicos. Para pasar a producción basta con DEMO_MODE=0 y
+# completar LOLCLI_ENDPOINTS con los paths reales.
+DEMO_MODE = os.getenv("DEMO_MODE", "0") == "1"
+
 CLINICS = {}
 user_sessions = {}
 
@@ -145,6 +154,200 @@ def _get_session_lock(session_key):
 
 
 # ------------------------------------------------------------------------
+# Modo demo (DEMO_MODE=1)
+# ------------------------------------------------------------------------
+# Todas las respuestas de abajo replican exactamente la estructura descrita en
+# "Documentos APIS QUirofanos.docx" (mismos nombres de campo y mismo sobre
+# status/code/message), para que al desplegarse los endpoints reales el resto
+# del bot no necesite ningún cambio.
+
+DEMO_QUIROFANOS = [
+    {"quicod": "Q-01", "quidel": "QUIRÓFANO GENERAL A",     "quidec": "PISO 2 - ALA NORTE",  "prisal_hora": 150.00},
+    {"quicod": "Q-02", "quidel": "QUIRÓFANO CIRUGÍA MENOR", "quidec": "PISO 1 - EMERGENCIA", "prisal_hora": 90.00},
+    {"quicod": "Q-03", "quidel": "QUIRÓFANO TRAUMATOLOGÍA", "quidec": "PISO 3 - ALA SUR",    "prisal_hora": 220.00},
+]
+
+DEMO_HORAS = [f"{h:02d}:00" for h in range(8, 18)]
+
+# Reservas hechas durante la demo: (quicod, fecha, hora) -> invnum. Permite que
+# un turno recién reservado aparezca ocupado al volver a listar, y que una
+# reserva traslapada sea rechazada igual que en el backend real.
+_demo_lock = threading.Lock()
+_demo_bookings = {}
+_demo_next_invnum = [4502]
+
+# Padrón de médicos real (vía ListaMedicos), usado para validar el medcod aun
+# en modo demo -- el médico que hace la demostración se autentica con su código
+# verdadero.
+_medicos_lock = threading.Lock()
+_medicos_by_clinic = {}
+
+
+def _fetch_medicos_directory(lolcli_url, token, entidad):
+    """Construye {medcod: {...}} recorriendo sedes -> servicios -> médicos."""
+    headers = {"Authorization": f"Basic {token}", "Content-Type": "application/json"}
+
+    def post(endpoint, payload):
+        resp = requests.post(f"{lolcli_url}/{endpoint}", json=payload, headers=headers, timeout=15)
+        resp.raise_for_status()
+        return resp.json()
+
+    directory = {}
+    sedes = post("ListaEstablecimientos", {"entidad": entidad}).get("establecimientos", [])
+    for sede in sedes:
+        siscod = sede.get("siscod")
+        servicios = post("ListaServiciosWsp", {"siscod": siscod}).get("servicios", [])
+        for servicio in servicios:
+            medicos = post("ListaMedicos", {"siscod": siscod, "sercod": servicio.get("sercod")}).get("medicos", [])
+            for medico in medicos:
+                directory.setdefault(str(medico.get("medcod", "")).strip(), {
+                    "medcod": medico.get("medcod", ""),
+                    "mednam": medico.get("mednam", ""),
+                    # ListaMedicos no expone la colegiatura (el "regesp" del
+                    # documento), así que se usa la especialidad, que es el
+                    # dato equivalente disponible en el sistema real.
+                    "regesp": servicio.get("serdes", ""),
+                    "siscod": siscod,
+                })
+    return directory
+
+
+def preload_medicos_directories():
+    """Carga el padrón de médicos de cada clínica al arrancar."""
+    for clinic_id, config in CLINICS.items():
+        try:
+            directory = _fetch_medicos_directory(
+                config["lolcli_url"], config["lolcli_token"], config["lolcli_entidad"]
+            )
+            with _medicos_lock:
+                _medicos_by_clinic[clinic_id] = directory
+            print(f"INFO: [{clinic_id}] {len(directory)} médico(s) cargado(s): {sorted(directory)}")
+        except Exception as e:
+            print(f"ERROR: [{clinic_id}] no se pudo cargar el padrón de médicos: {e}")
+
+
+def _get_medicos_directory(clinic_id):
+    """Padrón de la clínica; reintenta la carga si quedó vacía al arrancar."""
+    with _medicos_lock:
+        directory = _medicos_by_clinic.get(clinic_id)
+    if directory:
+        return directory
+    try:
+        directory = _fetch_medicos_directory(g.lolcli_url, g.lolcli_token, g.lolcli_entidad)
+    except Exception as e:
+        print(f"ERROR: [{clinic_id}] reintento de carga del padrón falló: {e}")
+        return {}
+    with _medicos_lock:
+        _medicos_by_clinic[clinic_id] = directory
+    return directory
+
+
+def _demo_slot_ocupado(quicod, fecha, hora):
+    """Ocupación base determinista (~25%), para que la agenda no salga vacía."""
+    seed = sum(ord(c) for c in quicod) + int(fecha.replace("-", "")) + int(hora[:2])
+    return seed % 4 == 0
+
+
+def _demo_slots_cubiertos(horini, horfin):
+    """Bloques horarios (HH:00) que cruza el intervalo [horini, horfin)."""
+    slots = []
+    cursor = horini.replace(minute=0, second=0, microsecond=0)
+    while cursor < horfin:
+        slots.append((cursor.strftime("%Y-%m-%d"), cursor.strftime("%H:00")))
+        cursor += timedelta(hours=1)
+    return slots
+
+
+def _demo_error(code, message, container, empty):
+    return {"status": "error", "code": code, "message": message, container: empty}
+
+
+def _demo_response(endpoint_key, payload):
+    if endpoint_key == "validar_medico":
+        medcod = str(payload.get("medcod", "")).strip()
+        directory = _get_medicos_directory(g.clinic_id)
+        medico = directory.get(medcod) or directory.get(medcod.lstrip("0"))
+        if not medico:
+            return _demo_error(400, "MEDICO NO EXISTE O NO SE ENCUENTRA ACTIVO", "medico", [])
+        return {
+            "status": "success", "code": 200, "message": "MEDICO VALIDADO CORRECTAMENTE",
+            "medico": [{
+                "medcod": medico["medcod"], "mednam": medico["mednam"],
+                "regesp": medico["regesp"], "valido": "S",
+            }],
+        }
+
+    if endpoint_key == "listar_quirofanos":
+        return {"status": "success", "code": 200, "message": "OK", "quirofanos": DEMO_QUIROFANOS}
+
+    if endpoint_key == "listar_turnos":
+        quicod = payload.get("xxquicod", "")
+        fecha = str(payload.get("xxfechaini", ""))
+        turnos = []
+        with _demo_lock:
+            for hora in DEMO_HORAS:
+                invnum = _demo_bookings.get((quicod, fecha, hora))
+                ocupado = invnum is not None or _demo_slot_ocupado(quicod, fecha, hora)
+                turnos.append({
+                    "fecha": f"{fecha}T00:00:00.000Z",
+                    "hora": hora,
+                    "intcod1": f"INT-{invnum}" if invnum else "",
+                    "medcod": "",
+                    "sepcon": "OCUPADO" if ocupado else "",
+                    "invnum": invnum or 0,
+                    "disponible": "N" if ocupado else "S",
+                })
+        return {"status": "success", "code": 200, "message": "OK", "turnos": turnos}
+
+    if endpoint_key == "calcular_precio":
+        try:
+            ini = datetime.strptime(payload["xxfechaini"], "%Y-%m-%dT%H:%M:%S")
+            fin = datetime.strptime(payload["xxfechafin"], "%Y-%m-%dT%H:%M:%S")
+        except (KeyError, ValueError):
+            return _demo_error(400, "FORMATO DE FECHA INVALIDO", "cotizacion", [])
+        if ini >= fin:
+            return _demo_error(400, "ERROR: La fecha de inicio no puede ser posterior a la fecha de fin.", "cotizacion", [])
+        quicod = payload.get("xxquicod", "")
+        quirofano = next((q for q in DEMO_QUIROFANOS if q["quicod"] == quicod), None)
+        minutos = int((fin - ini).total_seconds() // 60)
+        horas = round(minutos / 60, 2)
+        precio_hora = float(payload.get("xxprisal_hora") or (quirofano or {}).get("prisal_hora") or 0)
+        return {
+            "status": "success", "code": 200, "message": "CÁLCULO REALIZADO EXITOSAMENTE",
+            "cotizacion": [{
+                "quicod": quicod,
+                "quidel": (quirofano or {}).get("quidel", ""),
+                "minutos": minutos,
+                "horas": horas,
+                "precio_total": round(horas * precio_hora, 2),
+            }],
+        }
+
+    if endpoint_key == "registrar_separacion":
+        try:
+            ini = datetime.strptime(payload["xxhorini"], "%Y-%m-%dT%H:%M:%S")
+            fin = datetime.strptime(payload["xxhorfin"], "%Y-%m-%dT%H:%M:%S")
+        except (KeyError, ValueError):
+            return _demo_error(400, "FORMATO DE FECHA INVALIDO", "invnum", 0)
+        quicod = payload.get("xxquicod", "")
+        slots = _demo_slots_cubiertos(ini, fin)
+        with _demo_lock:
+            for fecha, hora in slots:
+                if (quicod, fecha, hora) in _demo_bookings or _demo_slot_ocupado(quicod, fecha, hora):
+                    return _demo_error(400, "EL HORARIO SOLICITADO PRESENTA CRUCE CON OTRA INTERVENCION", "invnum", 0)
+            invnum = _demo_next_invnum[0]
+            _demo_next_invnum[0] += 1
+            for fecha, hora in slots:
+                _demo_bookings[(quicod, fecha, hora)] = invnum
+        return {
+            "status": "success", "code": 200,
+            "message": "SEPARACION REGISTRADA EXITOSAMENTE", "invnum": invnum,
+        }
+
+    return _demo_error(500, "Error al obtener los registros", "data", [])
+
+
+# ------------------------------------------------------------------------
 # LOLCLI API client
 # ------------------------------------------------------------------------
 
@@ -158,6 +361,14 @@ def _call_lolcli(endpoint_key, payload, headers, timeout=8):
     Retorna (data, error_message). error_message es None si status == "success".
     """
     endpoint = LOLCLI_ENDPOINTS[endpoint_key]
+
+    if DEMO_MODE:
+        data = _demo_response(endpoint_key, payload)
+        print(f"DEMO {endpoint}: payload={payload} -> {data.get('status')} ({data.get('message')})")
+        if data.get("status") == "error":
+            return data, data.get("message", "Ocurrió un error inesperado.")
+        return data, None
+
     url = f"{g.lolcli_url}/{endpoint}"
     try:
         resp = requests.post(url, json=payload, headers=headers, timeout=timeout)
@@ -873,6 +1084,12 @@ def _replay_state(state, session, phone, lolcli_headers):
 # ---------------------------------------------------------------------------
 
 load_clinics()
+if DEMO_MODE:
+    print("INFO: DEMO_MODE activo -- quirófanos, turnos, precios y separaciones simulados.")
+    # El padrón sí es real: se precarga una vez para no recorrer
+    # sedes/servicios/médicos en cada validación. Si falla, _get_medicos_directory
+    # reintenta bajo demanda.
+    preload_medicos_directories()
 threading.Thread(target=session_cleanup_task, daemon=True).start()
 
 if __name__ == "__main__":
