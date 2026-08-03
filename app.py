@@ -32,14 +32,15 @@ app = Flask(__name__)
 EVOLUTION_API_URL = os.getenv("EVOLUTION_API_URL", "").rstrip("/")
 EVOLUTION_API_KEY = os.getenv("EVOLUTION_API_KEY")
 
-# DEMO_MODE=1 sustituye las 4 llamadas de quirófanos (listar, turnos, precio,
-# separación) por respuestas simuladas con la MISMA estructura que documenta
-# "Documentos APIS QUirofanos.docx", porque esos endpoints todavía no están
-# desplegados en LOLCLI (responden 404 en :3001 y :3011 con cualquier nombre).
-# La validación del médico NO se simula: se resuelve contra el padrón real
-# obtenido de ListaMedicos. Para pasar a producción basta con DEMO_MODE=0 y
-# completar LOLCLI_ENDPOINTS con los paths reales.
+# DEMO_MODE=1 simula ÚNICAMENTE los endpoints listados en DEMO_ENDPOINTS, que
+# son los que todavía no están operativos en LOLCLI. Todo lo demás sale del
+# sistema real. Al quedar los dos pendientes operativos, basta con DEMO_MODE=0.
 DEMO_MODE = os.getenv("DEMO_MODE", "0") == "1"
+
+# Estado verificado contra http://15.235.105.124:3011/LolcliApi/api (31/07/2026):
+# los 4 endpoints restantes responden correctamente; sólo el de turnos sigue
+# devolviendo 404 con cualquier nombre probado.
+DEMO_ENDPOINTS = {"listar_turnos"}
 
 CLINICS = {}
 user_sessions = {}
@@ -71,17 +72,30 @@ MONTHS_ES = [
 # Duración en horas ofrecida al médico para cada reserva.
 DURATION_OPTIONS_HOURS = [1, 1.5, 2, 3, 4]
 
-# NOTA: la documentación de la API ("Documentos APIS QUirofanos.docx") especifica
-# método (POST), content-type y los contratos de payload/respuesta de cada
-# endpoint, pero no el path literal. Los nombres abajo están inferidos de los
-# títulos de cada sección del documento y deben confirmarse con el equipo LOLCLI.
+# Endpoints según "Documentos APIS QUirofanos_V2.docx". Los marcados como
+# verificados responden 200 en producción; el de turnos sigue inferido del
+# título de la sección 2.3 porque el documento no lo nombra y aún da 404.
 LOLCLI_ENDPOINTS = {
-    "validar_medico": "ValidarMedico",              # 2.1 Validar Médico Quirófano
-    "listar_quirofanos": "ListarQuirofanos",         # 2.2 Listar Quirófanos
-    "listar_turnos": "ListarTurnosDisponibles",      # 2.3 Listar Turnos Disponibles
-    "registrar_separacion": "RegistrarSeparacionQuirofano",  # 2.4 Registrar Separación de Quirófano
-    "calcular_precio": "CalcularPrecioQuirofano",    # 2.5 Calcular Precio de Quirófano
+    "validar_medico": "ValidarMedicoQuirofanoWsp",           # 2.1 — verificado
+    "listar_quirofanos": "ListarQuirofanosWsp",              # 2.2 — verificado
+    "listar_turnos": "ListarTurnosDisponiblesWsp",           # 2.3 — POR CONFIRMAR (404)
+    "registrar_separacion": "RegistrarSeparacionQuirofanoWsp",  # 2.4 — existe, devuelve 500
+    "calcular_precio": "CalcularPrecioQuirofanoWsp",         # 2.5 — verificado
 }
+
+# Tipos de documento de identidad aceptados por ValidarMedicoQuirofanoWsp.
+# Los códigos fueron verificados uno a uno contra el API (05-09 y 11+ responden
+# "CODIGO TIPO DOCUMENTO DE IDENTIDAD NO EXISTE O NO HABILITADO"); las
+# descripciones son las de uso habitual y el cliente debe confirmarlas, ya que
+# LOLCLI no expone un endpoint que liste el catálogo.
+TIPOS_DOCUMENTO = [
+    ("01", "DNI"),
+    ("02", "Carné de extranjería"),
+    ("03", "Pasaporte"),
+    ("04", "Partida de nacimiento"),
+    ("10", "Carné de identidad"),
+    ("00", "Otro documento"),
+]
 
 
 # ------------------------------------------------------------------------
@@ -156,90 +170,18 @@ def _get_session_lock(session_key):
 # ------------------------------------------------------------------------
 # Modo demo (DEMO_MODE=1)
 # ------------------------------------------------------------------------
-# Todas las respuestas de abajo replican exactamente la estructura descrita en
-# "Documentos APIS QUirofanos.docx" (mismos nombres de campo y mismo sobre
-# status/code/message), para que al desplegarse los endpoints reales el resto
-# del bot no necesite ningún cambio.
-
-DEMO_QUIROFANOS = [
-    {"quicod": "Q-01", "quidel": "QUIRÓFANO GENERAL A",     "quidec": "PISO 2 - ALA NORTE",  "prisal_hora": 150.00},
-    {"quicod": "Q-02", "quidel": "QUIRÓFANO CIRUGÍA MENOR", "quidec": "PISO 1 - EMERGENCIA", "prisal_hora": 90.00},
-    {"quicod": "Q-03", "quidel": "QUIRÓFANO TRAUMATOLOGÍA", "quidec": "PISO 3 - ALA SUR",    "prisal_hora": 220.00},
-]
+# Sólo cubre los endpoints de DEMO_ENDPOINTS. Las respuestas replican la
+# estructura de "Documentos APIS QUirofanos_V2.docx" (mismos nombres de campo y
+# mismo sobre status/code/message), para que al quedar operativos los servicios
+# reales el resto del bot no necesite ningún cambio.
 
 DEMO_HORAS = [f"{h:02d}:00" for h in range(8, 18)]
 
-# Reservas hechas durante la demo: (quicod, fecha, hora) -> invnum. Permite que
-# un turno recién reservado aparezca ocupado al volver a listar, y que una
-# reserva traslapada sea rechazada igual que en el backend real.
+# Reservas ya registradas en LOLCLI durante esta ejecución:
+# (quicod, fecha, hora) -> invnum. Permite que un turno recién reservado
+# aparezca ocupado al volver a listar, pese a que la lista sea simulada.
 _demo_lock = threading.Lock()
 _demo_bookings = {}
-_demo_next_invnum = [4502]
-
-# Padrón de médicos real (vía ListaMedicos), usado para validar el medcod aun
-# en modo demo -- el médico que hace la demostración se autentica con su código
-# verdadero.
-_medicos_lock = threading.Lock()
-_medicos_by_clinic = {}
-
-
-def _fetch_medicos_directory(lolcli_url, token, entidad):
-    """Construye {medcod: {...}} recorriendo sedes -> servicios -> médicos."""
-    headers = {"Authorization": f"Basic {token}", "Content-Type": "application/json"}
-
-    def post(endpoint, payload):
-        resp = requests.post(f"{lolcli_url}/{endpoint}", json=payload, headers=headers, timeout=15)
-        resp.raise_for_status()
-        return resp.json()
-
-    directory = {}
-    sedes = post("ListaEstablecimientos", {"entidad": entidad}).get("establecimientos", [])
-    for sede in sedes:
-        siscod = sede.get("siscod")
-        servicios = post("ListaServiciosWsp", {"siscod": siscod}).get("servicios", [])
-        for servicio in servicios:
-            medicos = post("ListaMedicos", {"siscod": siscod, "sercod": servicio.get("sercod")}).get("medicos", [])
-            for medico in medicos:
-                directory.setdefault(str(medico.get("medcod", "")).strip(), {
-                    "medcod": medico.get("medcod", ""),
-                    "mednam": medico.get("mednam", ""),
-                    # ListaMedicos no expone la colegiatura (el "regesp" del
-                    # documento), así que se usa la especialidad, que es el
-                    # dato equivalente disponible en el sistema real.
-                    "regesp": servicio.get("serdes", ""),
-                    "siscod": siscod,
-                })
-    return directory
-
-
-def preload_medicos_directories():
-    """Carga el padrón de médicos de cada clínica al arrancar."""
-    for clinic_id, config in CLINICS.items():
-        try:
-            directory = _fetch_medicos_directory(
-                config["lolcli_url"], config["lolcli_token"], config["lolcli_entidad"]
-            )
-            with _medicos_lock:
-                _medicos_by_clinic[clinic_id] = directory
-            print(f"INFO: [{clinic_id}] {len(directory)} médico(s) cargado(s): {sorted(directory)}")
-        except Exception as e:
-            print(f"ERROR: [{clinic_id}] no se pudo cargar el padrón de médicos: {e}")
-
-
-def _get_medicos_directory(clinic_id):
-    """Padrón de la clínica; reintenta la carga si quedó vacía al arrancar."""
-    with _medicos_lock:
-        directory = _medicos_by_clinic.get(clinic_id)
-    if directory:
-        return directory
-    try:
-        directory = _fetch_medicos_directory(g.lolcli_url, g.lolcli_token, g.lolcli_entidad)
-    except Exception as e:
-        print(f"ERROR: [{clinic_id}] reintento de carga del padrón falló: {e}")
-        return {}
-    with _medicos_lock:
-        _medicos_by_clinic[clinic_id] = directory
-    return directory
 
 
 def _demo_slot_ocupado(quicod, fecha, hora):
@@ -263,23 +205,6 @@ def _demo_error(code, message, container, empty):
 
 
 def _demo_response(endpoint_key, payload):
-    if endpoint_key == "validar_medico":
-        medcod = str(payload.get("medcod", "")).strip()
-        directory = _get_medicos_directory(g.clinic_id)
-        medico = directory.get(medcod) or directory.get(medcod.lstrip("0"))
-        if not medico:
-            return _demo_error(400, "MEDICO NO EXISTE O NO SE ENCUENTRA ACTIVO", "medico", [])
-        return {
-            "status": "success", "code": 200, "message": "MEDICO VALIDADO CORRECTAMENTE",
-            "medico": [{
-                "medcod": medico["medcod"], "mednam": medico["mednam"],
-                "regesp": medico["regesp"], "valido": "S",
-            }],
-        }
-
-    if endpoint_key == "listar_quirofanos":
-        return {"status": "success", "code": 200, "message": "OK", "quirofanos": DEMO_QUIROFANOS}
-
     if endpoint_key == "listar_turnos":
         quicod = payload.get("xxquicod", "")
         fecha = str(payload.get("xxfechaini", ""))
@@ -299,52 +224,24 @@ def _demo_response(endpoint_key, payload):
                 })
         return {"status": "success", "code": 200, "message": "OK", "turnos": turnos}
 
-    if endpoint_key == "calcular_precio":
-        try:
-            ini = datetime.strptime(payload["xxfechaini"], "%Y-%m-%dT%H:%M:%S")
-            fin = datetime.strptime(payload["xxfechafin"], "%Y-%m-%dT%H:%M:%S")
-        except (KeyError, ValueError):
-            return _demo_error(400, "FORMATO DE FECHA INVALIDO", "cotizacion", [])
-        if ini >= fin:
-            return _demo_error(400, "ERROR: La fecha de inicio no puede ser posterior a la fecha de fin.", "cotizacion", [])
-        quicod = payload.get("xxquicod", "")
-        quirofano = next((q for q in DEMO_QUIROFANOS if q["quicod"] == quicod), None)
-        minutos = int((fin - ini).total_seconds() // 60)
-        horas = round(minutos / 60, 2)
-        precio_hora = float(payload.get("xxprisal_hora") or (quirofano or {}).get("prisal_hora") or 0)
-        return {
-            "status": "success", "code": 200, "message": "CÁLCULO REALIZADO EXITOSAMENTE",
-            "cotizacion": [{
-                "quicod": quicod,
-                "quidel": (quirofano or {}).get("quidel", ""),
-                "minutos": minutos,
-                "horas": horas,
-                "precio_total": round(horas * precio_hora, 2),
-            }],
-        }
-
-    if endpoint_key == "registrar_separacion":
-        try:
-            ini = datetime.strptime(payload["xxhorini"], "%Y-%m-%dT%H:%M:%S")
-            fin = datetime.strptime(payload["xxhorfin"], "%Y-%m-%dT%H:%M:%S")
-        except (KeyError, ValueError):
-            return _demo_error(400, "FORMATO DE FECHA INVALIDO", "invnum", 0)
-        quicod = payload.get("xxquicod", "")
-        slots = _demo_slots_cubiertos(ini, fin)
-        with _demo_lock:
-            for fecha, hora in slots:
-                if (quicod, fecha, hora) in _demo_bookings or _demo_slot_ocupado(quicod, fecha, hora):
-                    return _demo_error(400, "EL HORARIO SOLICITADO PRESENTA CRUCE CON OTRA INTERVENCION", "invnum", 0)
-            invnum = _demo_next_invnum[0]
-            _demo_next_invnum[0] += 1
-            for fecha, hora in slots:
-                _demo_bookings[(quicod, fecha, hora)] = invnum
-        return {
-            "status": "success", "code": 200,
-            "message": "SEPARACION REGISTRADA EXITOSAMENTE", "invnum": invnum,
-        }
-
     return _demo_error(500, "Error al obtener los registros", "data", [])
+
+
+def _demo_marcar_reservado(payload, invnum):
+    """Refleja en la agenda simulada una separación que sí se grabó en LOLCLI.
+
+    Las reservas son reales, pero la lista de turnos todavía se simula. Sin
+    esto, un turno recién reservado seguiría apareciendo libre al volver atrás.
+    """
+    try:
+        ini = datetime.strptime(payload["xxhorini"], "%Y-%m-%dT%H:%M:%S")
+        fin = datetime.strptime(payload["xxhorfin"], "%Y-%m-%dT%H:%M:%S")
+    except (KeyError, ValueError):
+        return
+    quicod = payload.get("xxquicod", "")
+    with _demo_lock:
+        for fecha, hora in _demo_slots_cubiertos(ini, fin):
+            _demo_bookings[(quicod, fecha, hora)] = invnum
 
 
 # ------------------------------------------------------------------------
@@ -362,7 +259,7 @@ def _call_lolcli(endpoint_key, payload, headers, timeout=8):
     """
     endpoint = LOLCLI_ENDPOINTS[endpoint_key]
 
-    if DEMO_MODE:
+    if DEMO_MODE and endpoint_key in DEMO_ENDPOINTS:
         data = _demo_response(endpoint_key, payload)
         print(f"DEMO {endpoint}: payload={payload} -> {data.get('status')} ({data.get('message')})")
         if data.get("status") == "error":
@@ -562,6 +459,35 @@ def session_cleanup_task():
 # Webhook
 # ---------------------------------------------------------------------------
 
+def _extract_phone(key):
+    """Devuelve el teléfono real del remitente, o "" si el JID no es de un chat
+    individual.
+
+    WhatsApp ya no siempre manda el número en 'remoteJid': para los contactos
+    con privacidad activada llega un identificador interno terminado en '@lid'
+    (p.ej. '91573131989148@lid'). Si se usa ese valor como número, Evolution
+    responde HTTP 400 y el médico nunca recibe la respuesta. En esos casos el
+    teléfono verdadero viaja en 'senderPn'.
+
+    También se descartan grupos ('@g.us') y estados ('status@broadcast'), que
+    no son números y producirían el mismo 400.
+    """
+    jid = key.get("remoteJid") or ""
+
+    if jid.endswith("@lid"):
+        pn = key.get("senderPn") or key.get("previousRemoteJid") or ""
+        if not pn:
+            # No se pudo resolver: se vuelca la clave completa para identificar
+            # en qué campo viene el número en esta versión de Evolution.
+            print(f"ERROR: JID @lid sin teléfono asociado -- key={key}")
+        return pn.split("@")[0]
+
+    if jid.endswith("@g.us") or jid == "status@broadcast":
+        return ""
+
+    return jid.split("@")[0]
+
+
 @app.route("/test", methods=["GET"])
 def test():
     return "OK", 200
@@ -585,13 +511,17 @@ def webhook_handler(clinic_id):
     data = request.json
     try:
         key = data["data"]["key"]
-        sender = key["remoteJid"].split("@")[0]
+        sender = _extract_phone(key)
         if key["fromMe"]:
             return jsonify({"status": "ignored_from_me"}), 200
         msg = data["data"]["message"]
         msg_id = key.get("id")
     except (KeyError, TypeError):
         return jsonify({"status": "ignored_format"}), 200
+
+    if not sender:
+        print(f"INFO: mensaje ignorado, remoteJid no es un chat individual ({key.get('remoteJid')})")
+        return jsonify({"status": "ignored_not_a_user"}), 200
 
     if not _mark_processed_if_new(msg_id):
         print(f"INFO: mensaje duplicado ignorado (id={msg_id}, sender={sender})")
@@ -662,7 +592,7 @@ def _handle_message(session_key, phone, message_text, selected_id, config, lolcl
         user_sessions[session_key] = session
         return jsonify({"status": "handoff_active"})
 
-    if normalized == "retroceder" and session.get("state") not in ["START", "AWAITING_AUTH"]:
+    if normalized == "retroceder" and session.get("state") not in ["START", "AWAITING_TIDCOD"]:
         history = session.get("history", [])
         if len(history) > 1:
             history.pop()
@@ -682,19 +612,43 @@ def _handle_message(session_key, phone, message_text, selected_id, config, lolcl
         session["history"] = ["START"]
         send_whatsapp_message(
             phone,
-            "👋 ¡Bienvenido/a al sistema de reservas de quirófanos LOLIMSA!\n\n"
-            "Para continuar, ingresa tu *código de médico (medcod)*:",
+            "👋 ¡Bienvenido/a al sistema de reservas de quirófanos LOLIMSA!",
         )
-        session["state"] = "AWAITING_AUTH"
+        _ask_tipo_documento(session, phone)
 
-    elif state == "AWAITING_AUTH":
-        medcod = message_text.strip().upper()
-        if not medcod:
-            send_whatsapp_message(phone, "⚠️ Por favor, ingresa tu código de médico.")
+    elif state == "AWAITING_TIDCOD":
+        tidcod = _resolve_tidcod(message_text, selected_id)
+        if not tidcod:
+            send_whatsapp_message(phone, "⚠️ Elige tu tipo de documento de la lista.")
         else:
-            resp_data, err = _call_lolcli("validar_medico", {"medcod": medcod}, lolcli_headers)
+            existe, err = _tidcod_existe(tidcod, lolcli_headers)
             if err:
                 send_whatsapp_message(phone, f"❌ {err}")
+            elif not existe:
+                send_whatsapp_message(
+                    phone,
+                    f"❌ El tipo de documento *{tidcod}* no existe o no está habilitado.",
+                )
+                _ask_tipo_documento(session, phone)
+            else:
+                session["tidcod"] = tidcod
+                session["tidnam"] = dict(TIPOS_DOCUMENTO).get(tidcod, tidcod)
+                session.setdefault("history", []).append("AWAITING_TIDCOD")
+                _ask_meddoc(session, phone)
+
+    elif state == "AWAITING_MEDDOC":
+        meddoc = message_text.strip()
+        if not meddoc:
+            send_whatsapp_message(phone, "⚠️ Por favor, ingresa tu número de documento.")
+        else:
+            resp_data, err = _call_lolcli(
+                "validar_medico",
+                {"tidcod": session.get("tidcod", ""), "meddoc": meddoc},
+                lolcli_headers,
+            )
+            if err:
+                # El documento manda imprimir el 'message' del API tal cual.
+                send_whatsapp_message(phone, f"❌ {err}\n\nVerifica tu número e inténtalo de nuevo.")
             else:
                 medicos = resp_data.get("medico", [])
                 if isinstance(medicos, dict):
@@ -702,16 +656,18 @@ def _handle_message(session_key, phone, message_text, selected_id, config, lolcl
                 medicos = [m for m in medicos if m.get("valido", "S") == "S"]
                 if medicos:
                     medico = medicos[0]
-                    session["medcod"] = medico.get("medcod", medcod)
-                    session["mednam"] = medico.get("mednam", medcod)
+                    session["meddoc"] = meddoc
+                    session["medcod"] = medico.get("medcod", "")
+                    session["mednam"] = medico.get("mednam", "")
                     session["regesp"] = medico.get("regesp", "")
-                    session.setdefault("history", []).append("AWAITING_AUTH")
+                    session.setdefault("history", []).append("AWAITING_MEDDOC")
                     send_whatsapp_message(phone, f"✅ ¡Hola, {session['mednam']}!")
                     show_main_menu(phone, session)
                 else:
                     send_whatsapp_message(
                         phone,
-                        "❌ No encontramos ese código de médico. Verifica e inténtalo de nuevo.",
+                        "❌ No encontramos un médico registrado con ese documento. "
+                        "Verifica el número e inténtalo de nuevo.",
                     )
 
     elif state == "AWAITING_MAIN_MENU":
@@ -787,9 +743,14 @@ def _handle_message(session_key, phone, message_text, selected_id, config, lolcl
         _show_booking_summary(session, phone)
 
     elif state == "AWAITING_CONFIRMATION":
-        if normalized in ["si", "sí", "confirmar", "confirm"]:
+        # Al pulsar el botón, Evolution manda selectedButtonId ('conf_si') y como
+        # texto la etiqueta completa con emoji ("✅ Sí, confirmar"), que no
+        # coincide con ninguna palabra suelta: sin mirar el id, la confirmación
+        # caía siempre en el 'else' y la reserva nunca se registraba.
+        choice = selected_id or normalized
+        if choice in ["conf_si", "si", "sí", "confirmar", "confirm"] or "confirmar" in choice:
             _confirm_booking(session, phone, lolcli_headers)
-        elif normalized in ["no", "retroceder"]:
+        elif choice in ["conf_no", "no", "retroceder"] or "retroceder" in choice:
             send_whatsapp_message(
                 phone,
                 "↩️ Escribe *'retroceder'* para corregir un paso o *'salir'* para cancelar.",
@@ -830,6 +791,75 @@ def _resolve_selection(message_text, selected_id, session):
             if opt["data"].get("_id") == selected_id:
                 return opt["data"]
     return process_user_choice(message_text, options)
+
+
+# --- Autenticación: tipo de documento (tidcod) + número de documento (meddoc) ---
+
+def _ask_tipo_documento(session, phone):
+    rows = [
+        {"id": f"tid_{code}", "title": label, "description": f"Código {code}"}
+        for code, label in TIPOS_DOCUMENTO
+    ]
+    send_list_message(
+        phone,
+        "Para identificarte, elige tu *tipo de documento*:",
+        sections=[{"title": "Tipo de documento", "rows": rows}],
+        title="Identificación",
+        button_text="Ver tipos",
+    )
+    session["state"] = "AWAITING_TIDCOD"
+
+
+def _ask_meddoc(session, phone):
+    send_whatsapp_message(
+        phone,
+        f"Ahora ingresa tu *número de documento* ({session.get('tidnam', '')}):",
+    )
+    session["state"] = "AWAITING_MEDDOC"
+
+
+def _resolve_tidcod(message_text, selected_id):
+    """Obtiene el tidcod de la selección de lista o de lo que el médico escribió.
+
+    Acepta el código con o sin cero a la izquierda ("1" -> "01") y el nombre del
+    documento ("dni" -> "01"), porque no todos los teléfonos renderizan la lista
+    interactiva y el médico puede terminar escribiendo la respuesta.
+    """
+    if selected_id and selected_id.startswith("tid_"):
+        return selected_id[4:]
+
+    texto = message_text.strip()
+    if not texto:
+        return ""
+    if texto.isdigit():
+        return texto.zfill(2)
+
+    objetivo = normalize_text(texto)
+    for code, label in TIPOS_DOCUMENTO:
+        if normalize_text(label) == objetivo:
+            return code
+    return texto
+
+
+def _tidcod_existe(tidcod, lolcli_headers):
+    """(existe, error) para un tipo de documento.
+
+    LOLCLI no publica un endpoint que liste el catálogo, pero
+    ValidarMedicoQuirofanoWsp sí distingue los dos casos: ante un tidcod
+    inhabilitado responde "... NO EXISTE O NO HABILITADO", y ante uno válido con
+    un documento inexistente responde "MEDICO NO SE ENCUENTRA REGISTRADO". Para
+    los códigos ya verificados se evita la llamada; cualquier otro se consulta
+    con un documento centinela.
+    """
+    if tidcod in dict(TIPOS_DOCUMENTO):
+        return True, None
+
+    resp_data, _ = _call_lolcli(
+        "validar_medico", {"tidcod": tidcod, "meddoc": "0"}, lolcli_headers
+    )
+    if resp_data is None:
+        return False, "No pudimos validar tu tipo de documento en este momento. Intenta de nuevo en unos minutos."
+    return "NO EXISTE O NO HABILITADO" not in (resp_data.get("message") or "").upper(), None
 
 
 def _start_booking_flow(session, phone, lolcli_headers):
@@ -1023,6 +1053,8 @@ def _confirm_booking(session, phone, lolcli_headers):
 
     invnum = resp_data.get("invnum", "—")
     session["invnum"] = invnum
+    if DEMO_MODE and "listar_turnos" in DEMO_ENDPOINTS:
+        _demo_marcar_reservado(payload, invnum)
     send_whatsapp_message(
         phone,
         f"✅ *¡Reserva confirmada!*\n\n"
@@ -1064,7 +1096,11 @@ def _trigger_human_handoff(session, phone, config, lolcli_headers):
 
 
 def _replay_state(state, session, phone, lolcli_headers):
-    if state == "AWAITING_QUIROFANO":
+    if state == "AWAITING_TIDCOD":
+        _ask_tipo_documento(session, phone)
+    elif state == "AWAITING_MEDDOC":
+        _ask_meddoc(session, phone)
+    elif state == "AWAITING_QUIROFANO":
         _start_booking_flow(session, phone, lolcli_headers)
     elif state == "AWAITING_DATE":
         _ask_date(session, phone, lolcli_headers)
@@ -1085,11 +1121,8 @@ def _replay_state(state, session, phone, lolcli_headers):
 
 load_clinics()
 if DEMO_MODE:
-    print("INFO: DEMO_MODE activo -- quirófanos, turnos, precios y separaciones simulados.")
-    # El padrón sí es real: se precarga una vez para no recorrer
-    # sedes/servicios/médicos en cada validación. Si falla, _get_medicos_directory
-    # reintenta bajo demanda.
-    preload_medicos_directories()
+    print(f"INFO: DEMO_MODE activo -- simulando sólo: {', '.join(sorted(DEMO_ENDPOINTS))}.")
+    print("INFO: el resto (validar médico, listar quirófanos, calcular precio) usa el API real.")
 threading.Thread(target=session_cleanup_task, daemon=True).start()
 
 if __name__ == "__main__":
