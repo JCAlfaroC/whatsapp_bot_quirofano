@@ -459,15 +459,25 @@ def session_cleanup_task():
 # Webhook
 # ---------------------------------------------------------------------------
 
-def _extract_phone(key):
-    """Devuelve el teléfono real del remitente, o "" si el JID no es de un chat
-    individual.
+# Campos donde Evolution/Baileys pueden traer el número real cuando el
+# remoteJid es un '@lid'. El nombre cambió entre versiones (Baileys pasó a
+# 'remoteJidAlt'), así que se prueban todos en orden.
+_LID_PHONE_FIELDS = ("senderPn", "remoteJidAlt", "participantAlt", "previousRemoteJid")
 
-    WhatsApp ya no siempre manda el número en 'remoteJid': para los contactos
-    con privacidad activada llega un identificador interno terminado en '@lid'
-    (p.ej. '91573131989148@lid'). Si se usa ese valor como número, Evolution
-    responde HTTP 400 y el médico nunca recibe la respuesta. En esos casos el
-    teléfono verdadero viaja en 'senderPn'.
+
+def _extract_phone(key):
+    """Devuelve el destinatario al que hay que responder, o "" si el JID no es
+    de un chat individual.
+
+    WhatsApp ya no siempre manda el número en 'remoteJid': desde que existen
+    los nombres de usuario (@miusuario), los contactos que ocultan su teléfono
+    llegan con un identificador interno terminado en '@lid' (p.ej.
+    '91573131989148@lid'). Si se usa ese valor como número, Evolution responde
+    HTTP 400 y el médico nunca recibe la respuesta.
+
+    En la mayoría de los casos el teléfono verdadero sí viaja en el mensaje,
+    en alguno de los campos de _LID_PHONE_FIELDS. Cuando no viaja en ninguno
+    se responde al propio '@lid': puede fallar, pero callarse falla siempre.
 
     También se descartan grupos ('@g.us') y estados ('status@broadcast'), que
     no son números y producirían el mismo 400.
@@ -475,12 +485,14 @@ def _extract_phone(key):
     jid = key.get("remoteJid") or ""
 
     if jid.endswith("@lid"):
-        pn = key.get("senderPn") or key.get("previousRemoteJid") or ""
-        if not pn:
-            # No se pudo resolver: se vuelca la clave completa para identificar
-            # en qué campo viene el número en esta versión de Evolution.
-            print(f"ERROR: JID @lid sin teléfono asociado -- key={key}")
-        return pn.split("@")[0]
+        for field in _LID_PHONE_FIELDS:
+            pn = (key.get(field) or "").split("@")[0]
+            if pn.isdigit():
+                return pn
+        # Se vuelca la clave completa para poder identificar en qué campo viene
+        # el número en esta versión de Evolution, si es que viene.
+        print(f"ADVERTENCIA: JID @lid sin teléfono asociado, se responderá al propio lid -- key={key}")
+        return jid
 
     if jid.endswith("@g.us") or jid == "status@broadcast":
         return ""
@@ -511,9 +523,12 @@ def webhook_handler(clinic_id):
     data = request.json
     try:
         key = data["data"]["key"]
-        sender = _extract_phone(key)
+        # El descarte de los mensajes propios va antes de resolver el número:
+        # así no se ensucia el log con advertencias de '@lid' por los envíos
+        # que hace el propio bot.
         if key["fromMe"]:
             return jsonify({"status": "ignored_from_me"}), 200
+        sender = _extract_phone(key)
         msg = data["data"]["message"]
         msg_id = key.get("id")
     except (KeyError, TypeError):
