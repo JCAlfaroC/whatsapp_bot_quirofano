@@ -1447,6 +1447,11 @@ def _show_mis_reservas(session, phone, lolcli_headers):
         send_whatsapp_message(phone, f"📭 {err}")
     else:
         separaciones = resp_data.get("separaciones", [])
+        # LOLCLI no las devuelve en orden cronológico (una reserva de agosto
+        # aparecía después de las de diciembre), y así el médico no puede ver
+        # de un vistazo cuál tiene más próxima. 'hora_inicio' trae fecha y hora
+        # en formato ISO, que ordena bien como texto.
+        separaciones = sorted(separaciones, key=lambda s: str(s.get("hora_inicio") or ""))
         if not separaciones:
             send_whatsapp_message(phone, "📭 No tienes reservas programadas de hoy en adelante.")
         else:
