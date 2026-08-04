@@ -123,6 +123,22 @@ def format_duration_es(hours):
     return f"{label} hora" + ("s" if hours != 1 else "")
 
 
+# Formato con el que se le mandan las marcas de tiempo a LOLCLI.
+#
+# La 'Z' del final NO significa que la hora sea UTC: es la única forma de que
+# el servidor guarde la hora tal cual se le manda. El API corre sobre Node y
+# convierte la cadena a Date; sin zona horaria la interpreta como hora local de
+# Lima (UTC-5) y la graba desplazada +5 (se mandaba 09:00 y quedaba 14:00, que
+# es lo que veía el médico en 'Mis reservas' y en el sistema). Comprobado
+# contra la base de pruebas:
+#     '2026-12-30T09:00:00'        -> guardado 14:00  (+5)
+#     '2026-12-28T15:00:00-05:00'  -> guardado 20:00  (+5)
+#     '2026-12-28T11:00:00Z'       -> guardado 11:00  (correcto)
+# Es además la convención que ya usan las reservas hechas desde el sistema de
+# escritorio, que vuelven con la hora local y una 'Z' de más.
+FMT_HORA_LOLCLI = "%Y-%m-%dT%H:%M:%SZ"
+
+
 def _hora_label(slot):
     """16 -> '08:00', 17 -> '08:30' (slot = hora*2 + 1 si es ':30').
 
@@ -1226,8 +1242,8 @@ def _cerrar_seleccion_horas(session, phone, lolcli_headers):
     horini_dt = datetime.strptime(f"{session['fecha_api']}T{_hora_label(sel[0])}", "%Y-%m-%dT%H:%M")
     # Cada elemento de 'sel' es un bloque de 30 minutos, no una hora.
     horfin_dt = horini_dt + timedelta(minutes=30 * len(sel))
-    session["horini"] = horini_dt.strftime("%Y-%m-%dT%H:%M:%S")
-    session["horfin"] = horfin_dt.strftime("%Y-%m-%dT%H:%M:%S")
+    session["horini"] = horini_dt.strftime(FMT_HORA_LOLCLI)
+    session["horfin"] = horfin_dt.strftime(FMT_HORA_LOLCLI)
     session["hora_user"] = horini_dt.strftime("%H:%M")
     session["hora_fin_user"] = _hora_label(sel[-1] + 1)
     session["duracion_horas"] = len(sel) / 2
@@ -1365,14 +1381,36 @@ def _confirm_booking(session, phone, lolcli_headers):
     payload = {
         "xxsiscod": g.default_siscod,
         "xxquicod": session["quicod"],
-        "xxsepdat": datetime.now().strftime("%Y-%m-%dT%H:%M:%S"),
+        "xxsepdat": datetime.now().strftime(FMT_HORA_LOLCLI),
         "xxhorini": session["horini"],
         "xxhorfin": session["horfin"],
         "xxmedcod": session["medcod"],
     }
     resp_data, err = _call_lolcli("registrar_separacion", payload, lolcli_headers, timeout=10)
     if err:
-        send_whatsapp_message(phone, f"❌ No se pudo registrar la reserva: {err}. Intenta de nuevo.")
+        # Un cruce de horarios no es un fallo del que el médico pueda salir
+        # reintentando: ese horario ya está tomado y confirmar de nuevo va a
+        # fallar igual. Se le devuelve a elegir horario en vez de dejarlo
+        # atascado en la pantalla de confirmación.
+        #
+        # Pasa más de lo que debería porque ListarTurnosQuirofanoDisponiblesWsp
+        # devuelve el día entero como libre aunque haya separaciones grabadas,
+        # así que el cruce recién se descubre aquí, al grabar.
+        cruce = any(p in err.upper() for p in ("CRUCE", "YA PRESENTA UNA RESERVA", "TRASLAP"))
+        if cruce:
+            send_whatsapp_message(
+                phone,
+                f"⚠️ El horario *{session.get('hora_user', '')} – "
+                f"{session.get('hora_fin_user', '')}* ya está reservado por otra "
+                f"intervención, así que no se pudo registrar.\n\n"
+                f"Elige otro horario 👇",
+            )
+            session["horas_sel"] = []
+            _ask_horas(session, phone, lolcli_headers)
+        else:
+            send_whatsapp_message(
+                phone, f"❌ No se pudo registrar la reserva: {err}. Intenta de nuevo."
+            )
         return
 
     invnum = resp_data.get("invnum", "—")
@@ -1414,10 +1452,16 @@ def _show_mis_reservas(session, phone, lolcli_headers):
         else:
             bloques = [f"📋 *Tus reservas programadas* ({len(separaciones)}):"]
             for s in separaciones:
+                # La fecha sale de 'hora_inicio', NO de 'fecha_separacion':
+                # ese campo es la fecha en que se registró la reserva, no la de
+                # la intervención. Se veía igual en todas (el día en que se
+                # grabaron) mientras las cirugías eran de días distintos, así
+                # que el médico veía la fecha equivocada en cada reserva.
+                # 'hora_inicio' trae la fecha y la hora reales del quirófano.
                 bloques.append(
                     f"\n🆔 *N° {s.get('invnum', '—')}*\n"
                     f"🏥 {s.get('quirofano_nombre') or s.get('quicod', '')}\n"
-                    f"🗓️ {_fmt_fecha_iso(s.get('fecha_separacion'))}\n"
+                    f"🗓️ {_fmt_fecha_iso(s.get('hora_inicio') or s.get('fecha_separacion'))}\n"
                     f"⏰ {_fmt_hora_iso(s.get('hora_inicio'))} – {_fmt_hora_iso(s.get('hora_fin'))}"
                 )
             send_whatsapp_message(phone, "\n".join(bloques))
