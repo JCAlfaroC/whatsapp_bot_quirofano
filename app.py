@@ -433,6 +433,19 @@ def _resolve_instance(instance):
         return os.getenv("EVOLUTION_INSTANCE_NAME", "")
 
 
+def _log_evolution_error(label, e):
+    """Registra el error real de una llamada a Evolution.
+
+    El texto de RequestException por sí solo ('400 Client Error: Bad Request
+    for url: ...') no dice qué campo rechazó la API; el cuerpo de la
+    respuesta sí trae el detalle (p.ej. qué propiedad falta o sobra), así que
+    se imprime también cuando hay una respuesta HTTP disponible.
+    """
+    resp = getattr(e, "response", None)
+    detalle = f" -- body: {resp.text[:500]}" if resp is not None else ""
+    print(f"ERROR {label}: {e}{detalle}")
+
+
 def send_whatsapp_message(phone, text, instance=None):
     time.sleep(1.2)
     inst = _resolve_instance(instance)
@@ -444,7 +457,7 @@ def send_whatsapp_message(phone, text, instance=None):
         ).raise_for_status()
         print(f"[TEXT] → {phone}")
     except requests.exceptions.RequestException as e:
-        print(f"ERROR send_whatsapp_message: {e}")
+        _log_evolution_error("send_whatsapp_message", e)
 
 
 def send_button_message(phone, body, buttons, instance=None, title="", footer="LOLIMSA Quirófanos"):
@@ -469,7 +482,8 @@ def send_button_message(phone, body, buttons, instance=None, title="", footer="L
         ).raise_for_status()
         print(f"[BUTTONS] → {phone}")
     except requests.exceptions.RequestException as e:
-        print(f"ERROR send_button_message: {e} — falling back to text")
+        _log_evolution_error("send_button_message", e)
+        print("  -- falling back to text")
         lines = "\n".join(f"*{i+1}.* {b['title']}" for i, b in enumerate(buttons))
         send_whatsapp_message(phone, f"{body}\n\n{lines}", inst)
 
@@ -478,13 +492,23 @@ def send_list_message(phone, body, sections, instance=None, title="", button_tex
     """sections = [{"title": "Sec", "rows": [{"id": "r1", "title": "T", "description": "D"}]}]
 
     Una fila puede traer además un 'number' opcional (sólo lo usa el fallback
-    de texto plano, ver más abajo); no se manda a Evolution para no meterle a
-    la API un campo que no espera.
+    de texto plano, ver más abajo).
+
+    A Evolution se le manda 'footerText' y 'rowId' (no 'footer'/'id'): son los
+    nombres que espera el endpoint /message/sendList; con los nombres viejos
+    la API devolvía 400 Bad Request y el mensaje nunca llegaba como lista
+    interactiva, siempre por el texto de respaldo.
     """
     time.sleep(1.2)
     inst = _resolve_instance(instance)
     api_sections = [
-        {**sec, "rows": [{k: v for k, v in row.items() if k != "number"} for row in sec.get("rows", [])]}
+        {
+            "title": sec.get("title", ""),
+            "rows": [
+                {"title": row["title"], "description": row.get("description", ""), "rowId": row["id"]}
+                for row in sec.get("rows", [])
+            ],
+        }
         for sec in sections
     ]
     payload = {
@@ -492,7 +516,7 @@ def send_list_message(phone, body, sections, instance=None, title="", button_tex
         "title": title,
         "description": body,
         "buttonText": button_text,
-        "footer": footer,
+        "footerText": footer,
         "sections": api_sections,
     }
     try:
@@ -503,7 +527,8 @@ def send_list_message(phone, body, sections, instance=None, title="", button_tex
         ).raise_for_status()
         print(f"[LIST] → {phone}")
     except requests.exceptions.RequestException as e:
-        print(f"ERROR send_list_message: {e} — falling back to text")
+        _log_evolution_error("send_list_message", e)
+        print("  -- falling back to text")
         lines = []
         counter = 0
         for row in [r for sec in sections for r in sec.get("rows", [])]:
