@@ -158,63 +158,69 @@ def _parse_hora_token(token):
     return hora * 2 + (1 if minuto == 30 else 0)
 
 
-def _hora_a_slots(token):
-    """Los slots de 30' que representa un token de hora al escribirlo.
+# Formato de respuesta que se le promete al médico en la pantalla de horarios.
+# Se muestra al pedir el horario y se repite tal cual en cada rechazo, para que
+# la regla que ve sea siempre la misma. Es exactamente lo que acepta
+# _parse_posiciones: si se cambia uno hay que cambiar el otro, o el bot estaría
+# prometiendo un formato que después rechaza.
+FORMATO_HORAS = (
+    "⚠️ *Responde SÓLO con números de la lista.*\n\n"
+    "• Un horario  →  *3*\n"
+    "• Varios  →  *3,4,5*\n"
+    "• Un rango  →  *3-5*\n\n"
+    "❌ No escribas la hora (*08:00*) ni palabras."
+)
 
-    Sin minuto ('8') son las DOS medias horas de esa hora completa, para que
-    escribir una hora suelta siga encadenando la hora entera (08:00-09:00)
-    como antes de que la agenda se separara en bloques de 30'. Con minuto
-    explícito ('8:30') es sólo ese bloque. None si el token no es una hora
-    válida.
+
+def _parse_posiciones(text, total):
+    """Posiciones (1-based) que pide el médico sobre la lista numerada.
+
+    Acepta los tres formatos que anuncia FORMATO_HORAS y nada más: un número
+    suelto ('3'), una lista por comas ('3,4,5') o un rango con guion ('3-5').
+    Se tolera el espacio alrededor de las comas ('3, 4, 5') porque el teclado
+    del teléfono lo agrega solo, pero no como separador ('3 4 5').
+
+    Devuelve [] si el texto no cumple, si algún número se sale de 1..total o si
+    el rango va al revés. El rechazo es en bloque, nunca parcial: la lista de
+    horarios cambia en cada consulta, así que aceptar '3,99' a medias
+    reservaría un horario que el médico no pidió.
     """
-    limpio = str(token).strip().lower().replace("hrs", "").replace("h", ":")
-    tiene_minuto = ":" in limpio and limpio.split(":", 1)[1].strip() != ""
-    slot = _parse_hora_token(token)
-    if slot is None:
-        return None
-    return [slot] if tiene_minuto else [slot, slot + 1]
+    limpio = str(text).strip()
+    if not limpio or total <= 0:
+        return []
 
+    def entero(token):
+        # isascii() además de isdigit() porque isdigit() acepta cosas como '²'
+        # o los dígitos índico-arábigos, y con esos int() revienta: una
+        # excepción aquí sería un 500 en el webhook, o sea el bot mudo.
+        token = token.strip()
+        return int(token) if token.isascii() and token.isdigit() else None
 
-def _parse_horas_texto(text):
-    """Horas que pide un texto libre, como lista ordenada de slots de 30'.
-
-    Acepta una hora suelta ('8' = la hora completa 08:00-09:00, '08:30' = sólo
-    esa media hora), una lista ('8,9,10', '8 y 9') o un rango ('8-11', '8 a
-    11'). Devuelve [] si no se entiende.
-
-    Los rangos son inclusivos *en bloques*: '8 a 11' son las horas 8, 9, 10 y
-    11 completas, o sea el quirófano de 08:00 a 12:00. Es ambiguo a propósito
-    de leer, así que quien llama debe mostrarle al médico el horario final
-    resultante.
-    """
-    limpio = str(text).strip().lower()
-    for sep in [" a ", " al ", " hasta ", "-", "–"]:
-        if sep in limpio:
-            partes = [p for p in limpio.split(sep) if p.strip()]
-            if len(partes) != 2:
-                return []
-            ini_slots, fin_slots = _hora_a_slots(partes[0]), _hora_a_slots(partes[1])
-            if ini_slots is None or fin_slots is None:
-                return []
-            ini, fin = ini_slots[0], fin_slots[-1]
-            if ini > fin:
-                return []
-            return list(range(ini, fin + 1))
-
-    horas = []
-    for token in limpio.replace(";", ",").replace(" y ", ",").split(","):
-        if not token.strip():
-            continue
-        slots = _hora_a_slots(token)
-        if slots is None:
+    if "-" in limpio:
+        partes = limpio.split("-")
+        if len(partes) != 2:
             return []
-        horas.extend(slots)
-    return sorted(set(horas))
+        ini, fin = entero(partes[0]), entero(partes[1])
+        if ini is None or fin is None or ini > fin:
+            return []
+        # Los extremos se validan ANTES de armar la lista: con '1-99999999999'
+        # el range() se comería la memoria del proceso antes de que nadie
+        # pudiera rechazarlo.
+        if not (1 <= ini <= total and 1 <= fin <= total):
+            return []
+        posiciones = list(range(ini, fin + 1))
+    else:
+        posiciones = []
+        for token in limpio.split(","):
+            numero = entero(token)
+            if numero is None:
+                return []
+            posiciones.append(numero)
+        posiciones = sorted(set(posiciones))
 
-
-def _rango_label(horas):
-    """[16,17,18,19] -> '08:00–10:00' (el bloque 09:30 ocupa hasta las 10:00)."""
-    return f"{_hora_label(horas[0])}–{_hora_label(horas[-1] + 1)}"
+    if any(not 1 <= p <= total for p in posiciones):
+        return []
+    return posiciones
 
 
 def _fmt_hora_iso(valor):
@@ -433,6 +439,19 @@ def _resolve_instance(instance):
         return os.getenv("EVOLUTION_INSTANCE_NAME", "")
 
 
+def _log_evolution_error(label, e):
+    """Registra el error real de una llamada a Evolution.
+
+    El texto de RequestException por sí solo ('400 Client Error: Bad Request
+    for url: ...') no dice qué campo rechazó la API; el cuerpo de la
+    respuesta sí trae el detalle (p.ej. qué propiedad falta o sobra), así que
+    se imprime también cuando hay una respuesta HTTP disponible.
+    """
+    resp = getattr(e, "response", None)
+    detalle = f" -- body: {resp.text[:500]}" if resp is not None else ""
+    print(f"ERROR {label}: {e}{detalle}")
+
+
 def send_whatsapp_message(phone, text, instance=None):
     time.sleep(1.2)
     inst = _resolve_instance(instance)
@@ -444,7 +463,7 @@ def send_whatsapp_message(phone, text, instance=None):
         ).raise_for_status()
         print(f"[TEXT] → {phone}")
     except requests.exceptions.RequestException as e:
-        print(f"ERROR send_whatsapp_message: {e}")
+        _log_evolution_error("send_whatsapp_message", e)
 
 
 def send_button_message(phone, body, buttons, instance=None, title="", footer="LOLIMSA Quirófanos"):
@@ -469,7 +488,8 @@ def send_button_message(phone, body, buttons, instance=None, title="", footer="L
         ).raise_for_status()
         print(f"[BUTTONS] → {phone}")
     except requests.exceptions.RequestException as e:
-        print(f"ERROR send_button_message: {e} — falling back to text")
+        _log_evolution_error("send_button_message", e)
+        print("  -- falling back to text")
         lines = "\n".join(f"*{i+1}.* {b['title']}" for i, b in enumerate(buttons))
         send_whatsapp_message(phone, f"{body}\n\n{lines}", inst)
 
@@ -477,14 +497,26 @@ def send_button_message(phone, body, buttons, instance=None, title="", footer="L
 def send_list_message(phone, body, sections, instance=None, title="", button_text="Ver opciones", footer=""):
     """sections = [{"title": "Sec", "rows": [{"id": "r1", "title": "T", "description": "D"}]}]
 
-    Una fila puede traer además un 'number' opcional (sólo lo usa el fallback
-    de texto plano, ver más abajo); no se manda a Evolution para no meterle a
-    la API un campo que no espera.
+    A Evolution se le manda 'footerText' y 'rowId' (no 'footer'/'id'): son los
+    nombres que espera el endpoint /message/sendList; con los nombres viejos
+    la API devolvía 400 Bad Request y el mensaje nunca llegaba como lista
+    interactiva, siempre por el texto de respaldo.
+
+    Sólo la usan pantallas cuyas opciones se responden por posición (tipo de
+    documento, quirófano, fecha, menú), así que el respaldo de texto puede
+    numerarlas 1, 2, 3... sin ambigüedad. La pantalla de horarios no pasa por
+    aquí: se arma directamente como texto numerado en _send_horas_numeradas.
     """
     time.sleep(1.2)
     inst = _resolve_instance(instance)
     api_sections = [
-        {**sec, "rows": [{k: v for k, v in row.items() if k != "number"} for row in sec.get("rows", [])]}
+        {
+            "title": sec.get("title", ""),
+            "rows": [
+                {"title": row["title"], "description": row.get("description", ""), "rowId": row["id"]}
+                for row in sec.get("rows", [])
+            ],
+        }
         for sec in sections
     ]
     payload = {
@@ -492,7 +524,7 @@ def send_list_message(phone, body, sections, instance=None, title="", button_tex
         "title": title,
         "description": body,
         "buttonText": button_text,
-        "footer": footer,
+        "footerText": footer,
         "sections": api_sections,
     }
     try:
@@ -503,22 +535,15 @@ def send_list_message(phone, body, sections, instance=None, title="", button_tex
         ).raise_for_status()
         print(f"[LIST] → {phone}")
     except requests.exceptions.RequestException as e:
-        print(f"ERROR send_list_message: {e} — falling back to text")
-        lines = []
-        counter = 0
-        for row in [r for sec in sections for r in sec.get("rows", [])]:
-            counter += 1
-            # Por defecto el texto numera por posición (1, 2, 3...), que es lo
-            # que 'process_user_choice' espera al leer la respuesta. Algunas
-            # pantallas (como la de horas) necesitan que el número mostrado
-            # coincida con otro valor (la hora real) en vez de la posición, o
-            # que la fila no lleve número porque se responde con una palabra;
-            # para esas, la fila puede traer su propio 'number' (o None).
-            numero = row["number"] if "number" in row else counter
-            if numero is None:
-                lines.append(f"• {row['title']}")
-            else:
-                lines.append(f"*{numero}.* {row['title']}")
+        _log_evolution_error("send_list_message", e)
+        print("  -- falling back to text")
+        # Se numera por posición, que es lo que 'process_user_choice' espera al
+        # leer la respuesta: el número que ve el médico es el que el bot
+        # entiende.
+        lines = [
+            f"*{i}.* {row['title']}"
+            for i, row in enumerate([r for sec in sections for r in sec.get("rows", [])], 1)
+        ]
         send_whatsapp_message(phone, f"{body}\n\n" + "\n".join(lines), inst)
 
 
@@ -877,17 +902,12 @@ def _handle_message(session_key, phone, message_text, selected_id, config, lolcl
             send_whatsapp_message(phone, "❓ No reconocí esa fecha. Elige una de la lista.")
 
     elif state == "AWAITING_HORAS":
-        _handle_horas(session, phone, message_text, selected_id, normalized, lolcli_headers)
+        _handle_horas(session, phone, message_text, selected_id, lolcli_headers)
 
     elif state == "AWAITING_CONFIRMATION":
-        # Al pulsar el botón, Evolution manda selectedButtonId ('conf_si') y como
-        # texto la etiqueta completa con emoji ("✅ Sí, confirmar"), que no
-        # coincide con ninguna palabra suelta: sin mirar el id, la confirmación
-        # caía siempre en el 'else' y la reserva nunca se registraba.
-        # Cuando el envío de botones falla, send_button_message reenvía como
-        # texto numerado por posición ("1. ✅ Confirmar", "2. ↩️ Retroceder"),
-        # así que también se acepta "1"/"2": si no, el médico escribe el
-        # número que ve y el flujo se queda trabado sin avanzar.
+        # El resumen ofrece '1' y '2'. Se siguen aceptando las palabras y los
+        # ids de botón por si el médico contesta con el texto de siempre o si
+        # el servidor llega a soportar botones interactivos.
         choice = selected_id or normalized
         if choice in ["conf_si", "si", "sí", "confirmar", "confirm", "1"] or "confirmar" in choice:
             _confirm_booking(session, phone, lolcli_headers)
@@ -897,18 +917,23 @@ def _handle_message(session_key, phone, message_text, selected_id, config, lolcl
                 "↩️ Escribe *'retroceder'* para corregir un paso o *'salir'* para cancelar.",
             )
         else:
-            send_button_message(
+            send_whatsapp_message(
                 phone,
-                "¿Confirmas la reserva?",
-                [{"id": "conf_si", "title": "✅ Sí, confirmar"},
-                 {"id": "conf_no", "title": "↩️ Retroceder"}],
+                "❓ Responde *1* para confirmar la reserva o *2* para retroceder.",
             )
 
     elif state == "AWAITING_POST_FLOW":
         if normalized in ["continuar", "continue", "hola", "menu", "menú"]:
+            # Los datos del médico se leen ANTES de limpiar: 'session' es el
+            # mismo objeto que user_sessions[session_key], así que session.clear()
+            # vacía también el diccionario del que se leerían después. Al leerlos
+            # al final, medcod y mednam volvían siempre vacíos y la siguiente
+            # reserva se grababa con 'xxmedcod' en blanco.
+            medcod = session.get("medcod", "")
+            mednam = session.get("mednam", "")
             session.clear()
-            session["medcod"] = user_sessions.get(session_key, {}).get("medcod", "")
-            session["mednam"] = user_sessions.get(session_key, {}).get("mednam", "")
+            session["medcod"] = medcod
+            session["mednam"] = mednam
             show_main_menu(phone, session)
         else:
             send_whatsapp_message(
@@ -1105,123 +1130,90 @@ def _ask_horas(session, phone, lolcli_headers):
         )
         return
 
-    session["horas_disponibles"] = horas
     session["horas_sel"] = []
+    # Misma forma de 'options' que las pantallas de quirófano y fecha, para que
+    # el número que escribe el médico signifique lo mismo en todo el bot: la
+    # posición en la lista que acaba de ver. Como 'options' se arma sólo con los
+    # bloques libres, todo lo que el médico pueda elegir está disponible por
+    # construcción y no hace falta revalidarlo después.
+    session["options"] = [
+        {"id": i + 1, "data": {"_id": f"hora_{slot}", "slot": slot, "label": _hora_label(slot)}}
+        for i, slot in enumerate(horas)
+    ]
     session["state"] = "AWAITING_HORAS"
-    _send_horas_list(session, phone)
+    _send_horas_numeradas(session, phone)
 
 
-def _send_horas_list(session, phone):
-    """Muestra la lista de horas según lo que el médico lleve elegido.
+def _send_horas_numeradas(session, phone):
+    """Muestra los bloques libres como una lista numerada de texto plano.
 
-    Cada opción es un bloque de 30 minutos, igual que en la agenda real.
-    Mientras no haya nada elegido se ofrecen todos los bloques libres. En
-    cuanto hay una selección sólo se ofrecen los dos bloques pegados (el
-    anterior y el siguiente): así el horario no puede quedar con huecos, que
-    es lo que la base necesita para grabarlo como un único intervalo.
+    No se usa send_list_message a propósito: la lista interactiva de WhatsApp
+    admite pocas filas y aquí puede haber más de 40 bloques de 30 minutos, así
+    que el texto es el único render que siempre entra completo. Con un solo
+    camino de render, el número que ve el médico es siempre el que entiende
+    _handle_horas.
     """
-    disponibles = session.get("horas_disponibles", [])
-    sel = session.get("horas_sel", [])
-    rows = []
-
-    def add(row_id, title, description=""):
-        # 'number': None para que, si el mensaje de lista falla y WhatsApp cae
-        # a texto plano, no se numere por posición. En esta pantalla el médico
-        # responde con la hora misma ('8:30' para un bloque, '8' para
-        # encadenar la hora completa) y no con la fila en la lista — un número
-        # de posición ahí le haría reservar un horario distinto del que ve.
-        rows.append({"id": row_id, "title": title, "description": description, "number": None})
-
-    if sel:
-        add("horas_listo", f"✅ Listo — {_rango_label(sel)}",
-            f"Reservar {format_duration_es(len(sel) / 2)} y continuar")
-        for slot in (sel[0] - 1, sel[-1] + 1):
-            if slot in disponibles:
-                add(f"hora_{slot}", f"➕ {_hora_label(slot)}", "Sumar este bloque al horario")
-        add("horas_reset", "🔄 Empezar de nuevo", "Borrar las horas elegidas")
-        body = (
-            f"Llevas *{_rango_label(sel)}* ({format_duration_es(len(sel) / 2)}).\n\n"
-            "Suma otro bloque escribiendo su hora (por ejemplo *8:30*, o *9* para sumar "
-            "la hora completa), o escribe *listo* para continuar."
-        )
-    else:
-        for slot in disponibles:
-            add(f"hora_{slot}", _hora_label(slot))
-        body = (
-            f"Elige la *hora de inicio* en *{session['quidel']}* para *{session['fecha_user']}*.\n\n"
-            "_Escribe una hora suelta para encadenar la hora completa (por ejemplo *8*), "
-            "o con minutos para un solo bloque de 30 min (por ejemplo *8:30*). "
-            "También puedes escribir un rango, por ejemplo *8 a 11*._"
-        )
-
-    send_list_message(
+    opciones = session.get("options", [])
+    lineas = "\n".join(f"*{o['id']}.* {o['data']['label']}" for o in opciones)
+    send_whatsapp_message(
         phone,
-        body,
-        sections=[{"title": "Horarios", "rows": rows}],
-        button_text="Ver horarios",
+        f"🕐 *Horarios disponibles*\n"
+        f"🏥 {session.get('quidel', '')}\n"
+        f"🗓️ {session.get('fecha_user', '')}\n\n"
+        f"{lineas}\n\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"{FORMATO_HORAS}",
     )
 
 
-def _agregar_horas(session, nuevas):
-    """Suma bloques de 30' a la selección. Devuelve (ok, mensaje_de_error)."""
-    disponibles = set(session.get("horas_disponibles", []))
-    ocupadas = [h for h in nuevas if h not in disponibles]
-    if ocupadas:
-        return False, (
-            "Estos horarios no están disponibles: "
-            + ", ".join(_hora_label(h) for h in sorted(ocupadas))
-        )
-
-    combinadas = sorted(set(session.get("horas_sel", [])) | set(nuevas))
-    if any(b - a != 1 for a, b in zip(combinadas, combinadas[1:])):
-        return False, "Los bloques deben ser seguidos, sin saltos entre ellos."
-
-    session["horas_sel"] = combinadas
-    return True, None
-
-
-def _handle_horas(session, phone, message_text, selected_id, normalized, lolcli_headers):
+def _handle_horas(session, phone, message_text, selected_id, lolcli_headers):
     """Procesa una respuesta en la pantalla de selección de horas.
 
-    Aquí NO se usa _resolve_selection: esa función empareja por número de
-    opción, y en esta pantalla un "8" significa la hora 08:00 (completa), no
-    la octava fila de la lista. Confundirlos reservaría el horario equivocado.
+    El médico responde con la POSICIÓN en la lista numerada, igual que en las
+    pantallas de quirófano y fecha. Antes esta pantalla leía el número como la
+    hora en sí ('3' = 03:00) y, como los horarios ocupados no se muestran, la
+    posición y la hora casi nunca coincidían: el médico escribía el número que
+    veía y terminaba reservando otro horario.
     """
-    if selected_id == "horas_listo" or normalized in ["listo", "ok", "continuar", "terminar", "ya"]:
-        _cerrar_seleccion_horas(session, phone, lolcli_headers)
-        return
-
-    if selected_id == "horas_reset" or normalized in ["empezar de nuevo", "reiniciar", "borrar"]:
-        session["horas_sel"] = []
-        _send_horas_list(session, phone)
-        return
+    opciones = session.get("options", [])
 
     if selected_id and selected_id.startswith("hora_"):
-        nuevas = [int(selected_id.split("_", 1)[1])]
+        # Un tap en la lista interactiva, si el servidor llegara a soportarla,
+        # ya trae el bloque elegido; equivale a una sola posición.
+        posiciones = [i + 1 for i, o in enumerate(opciones) if o["data"]["_id"] == selected_id]
     else:
-        nuevas = _parse_horas_texto(message_text)
+        posiciones = _parse_posiciones(message_text, len(opciones))
 
-    if not nuevas:
-        send_whatsapp_message(
-            phone,
-            "❓ No entendí ese horario. Elige una hora de la lista, o escribe algo como *8* o *8 a 11*.",
-        )
+    if not posiciones:
+        send_whatsapp_message(phone, f"❓ No entendí esa respuesta.\n\n{FORMATO_HORAS}")
+        _send_horas_numeradas(session, phone)
         return
 
-    ok, err = _agregar_horas(session, nuevas)
-    if not ok:
-        send_whatsapp_message(phone, f"⚠️ {err}")
-    # En ambos casos se reenvía la lista: si salió bien muestra el bloque
-    # acumulado (para que el médico vea la hora de fin real antes de seguir), y
-    # si falló vuelve a ofrecer las opciones válidas.
-    _send_horas_list(session, phone)
+    slots = [opciones[p - 1]["data"]["slot"] for p in posiciones]
+    if any(b - a != 1 for a, b in zip(slots, slots[1:])):
+        # Las posiciones sí son seguidas, pero los horarios detrás no: entre
+        # medio hay un turno ocupado que no aparece en la lista. Se nombran los
+        # horarios elegidos porque, mirando sólo los números, el médico no
+        # tiene cómo saber por qué se le rechaza una selección consecutiva.
+        send_whatsapp_message(
+            phone,
+            "⚠️ Elegiste "
+            + ", ".join(_hora_label(s) for s in slots)
+            + ", y no son horarios seguidos.\n\n"
+            "La reserva tiene que ser un solo bloque continuo, sin huecos.",
+        )
+        _send_horas_numeradas(session, phone)
+        return
+
+    session["horas_sel"] = slots
+    _cerrar_seleccion_horas(session, phone, lolcli_headers)
 
 
 def _cerrar_seleccion_horas(session, phone, lolcli_headers):
     sel = session.get("horas_sel", [])
     if not sel:
-        send_whatsapp_message(phone, "⚠️ Primero elige al menos una hora.")
-        _send_horas_list(session, phone)
+        send_whatsapp_message(phone, "⚠️ Primero elige al menos un horario.")
+        _send_horas_numeradas(session, phone)
         return
 
     horini_dt = datetime.strptime(f"{session['fecha_api']}T{_hora_label(sel[0])}", "%Y-%m-%dT%H:%M")
@@ -1232,11 +1224,16 @@ def _cerrar_seleccion_horas(session, phone, lolcli_headers):
     session["hora_user"] = horini_dt.strftime("%H:%M")
     session["hora_fin_user"] = _hora_label(sel[-1] + 1)
     session["duracion_horas"] = len(sel) / 2
-    session.setdefault("history", []).append("AWAITING_HORAS")
-    _calcular_precio_y_continuar(session, phone, lolcli_headers)
+    # El paso sólo se da por respondido si se llegó al resumen. Si el cálculo
+    # de precio falla, el médico se queda en esta pantalla y cada reintento
+    # agregaría una entrada repetida al historial, haciendo que un 'retroceder'
+    # posterior se quede dando vueltas en el mismo paso.
+    if _calcular_precio_y_continuar(session, phone, lolcli_headers):
+        session.setdefault("history", []).append("AWAITING_HORAS")
 
 
 def _calcular_precio_y_continuar(session, phone, lolcli_headers):
+    """Cotiza el horario elegido y muestra el resumen. True si se llegó a él."""
     payload = {
         "xxquicod": session["quicod"],
         "xxfechaini": session["horini"],
@@ -1246,12 +1243,12 @@ def _calcular_precio_y_continuar(session, phone, lolcli_headers):
     resp_data, err = _call_lolcli("calcular_precio", payload, lolcli_headers, timeout=10)
     if err:
         send_whatsapp_message(phone, f"❌ {err}")
-        return
+        return False
 
     cotizaciones = resp_data.get("cotizacion", [])
     if not cotizaciones:
         send_whatsapp_message(phone, "😔 No pudimos calcular el precio. Intenta de nuevo.")
-        return
+        return False
 
     cot = cotizaciones[0]
     session["precio_total"] = float(cot.get("precio_total") or 0)
@@ -1260,11 +1257,19 @@ def _calcular_precio_y_continuar(session, phone, lolcli_headers):
     # Ya no se pregunta por el procedimiento: el nombre del quirófano indica su
     # especialidad y su uso, así que preguntarlo era un paso de más.
     _show_booking_summary(session, phone)
+    return True
 
 
 def _show_booking_summary(session, phone):
+    """Resumen de lo elegido y las dos opciones, también numeradas.
+
+    Se responde con un número, igual que en el resto del flujo, en vez de con
+    botones: los botones de Evolution fallan en este servidor y al caer a texto
+    quedaban dos formas distintas de contestar la misma pregunta.
+    """
     precio = session.get("precio_total", 0)
-    summary = (
+    send_whatsapp_message(
+        phone,
         f"📋 *Resumen de la reserva:*\n\n"
         f"👨‍⚕️ *Médico:* {session.get('mednam', '')}\n"
         f"🏥 *Quirófano:* {session.get('quidel', '')}\n"
@@ -1275,13 +1280,10 @@ def _show_booking_summary(session, phone):
         f"💰 *Total:* S/ {precio:.2f}\n\n"
         f"Al confirmar, la reserva queda registrada en el sistema.\n"
         f"_El pago se coordina por separado._\n\n"
-        f"¿Confirmas la reserva?"
-    )
-    send_button_message(
-        phone,
-        summary,
-        [{"id": "conf_si", "title": "✅ Confirmar"},
-         {"id": "conf_no", "title": "↩️ Retroceder"}],
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"*1.* ✅ Confirmar reserva\n"
+        f"*2.* ↩️ Retroceder\n\n"
+        f"Responde *1* o *2*.",
     )
     session["state"] = "AWAITING_CONFIRMATION"
 
@@ -1334,6 +1336,20 @@ def _iniciar_pago(session, phone):
 
 
 def _confirm_booking(session, phone, lolcli_headers):
+    # Una separación ya grabada no se vuelve a grabar. El dedup del webhook
+    # (_mark_processed_if_new) no cubre este caso, porque dos "confirmar"
+    # escritos por el médico son mensajes distintos con id distinto, y LOLCLI
+    # aceptaría el segundo como una reserva nueva sobre el mismo horario.
+    if session.get("invnum"):
+        send_whatsapp_message(
+            phone,
+            f"ℹ️ Esta reserva ya estaba registrada con el "
+            f"*N° de intervención {session['invnum']}*.\n\n"
+            f"Escribe *'continuar'* para hacer otra reserva o *'salir'* para cerrar la sesión.",
+        )
+        session["state"] = "AWAITING_POST_FLOW"
+        return
+
     # El cobro va antes de grabar. Hoy _iniciar_pago siempre devuelve False y
     # se pasa de largo, que es lo acordado para esta etapa.
     if _iniciar_pago(session, phone):
