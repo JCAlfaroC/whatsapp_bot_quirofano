@@ -131,31 +131,61 @@ def format_duration_es(hours):
     return f"{label} hora" + ("s" if hours != 1 else "")
 
 
-def _hora_label(h):
-    """8 -> '08:00'. Acepta 24 para representar el fin de una reserva que
-    termina a medianoche."""
-    return f"{h:02d}:00"
+def _hora_label(slot):
+    """16 -> '08:00', 17 -> '08:30' (slot = hora*2 + 1 si es ':30').
+
+    Acepta 48 para representar el fin de una reserva que termina a
+    medianoche."""
+    hora, resto = divmod(slot, 2)
+    return f"{hora:02d}:{30 if resto else 0:02d}"
 
 
 def _parse_hora_token(token):
-    """'8', '08', '08:00', '8h' -> 8. None si no es una hora válida (0-23)."""
-    token = str(token).strip().lower().replace("hrs", "").replace("h", "")
-    token = token.split(":")[0].strip()
-    if not token.isdigit():
+    """'8', '08', '08:00', '8h', '8:30', '8h30' -> el slot de 30' (0-47) en el
+    que empieza esa hora. None si no es una hora en punto o y media válida
+    (00:00 a 23:30): LOLCLI separa la agenda en bloques de 30 minutos, así que
+    cualquier otro minuto no corresponde a un turno real.
+    """
+    token = str(token).strip().lower().replace("hrs", "").replace("h", ":")
+    partes = token.split(":")
+    hora_txt = partes[0].strip()
+    minuto_txt = partes[1].strip() if len(partes) > 1 and partes[1].strip() else "0"
+    if not hora_txt.isdigit() or not minuto_txt.isdigit():
         return None
-    hora = int(token)
-    return hora if 0 <= hora <= 23 else None
+    hora, minuto = int(hora_txt), int(minuto_txt)
+    if not (0 <= hora <= 23) or minuto not in (0, 30):
+        return None
+    return hora * 2 + (1 if minuto == 30 else 0)
+
+
+def _hora_a_slots(token):
+    """Los slots de 30' que representa un token de hora al escribirlo.
+
+    Sin minuto ('8') son las DOS medias horas de esa hora completa, para que
+    escribir una hora suelta siga encadenando la hora entera (08:00-09:00)
+    como antes de que la agenda se separara en bloques de 30'. Con minuto
+    explícito ('8:30') es sólo ese bloque. None si el token no es una hora
+    válida.
+    """
+    limpio = str(token).strip().lower().replace("hrs", "").replace("h", ":")
+    tiene_minuto = ":" in limpio and limpio.split(":", 1)[1].strip() != ""
+    slot = _parse_hora_token(token)
+    if slot is None:
+        return None
+    return [slot] if tiene_minuto else [slot, slot + 1]
 
 
 def _parse_horas_texto(text):
-    """Horas que pide un texto libre, como lista ordenada de enteros.
+    """Horas que pide un texto libre, como lista ordenada de slots de 30'.
 
-    Acepta una hora suelta ('8', '08:00'), una lista ('8,9,10', '8 y 9') o un
-    rango ('8-11', '8 a 11'). Devuelve [] si no se entiende.
+    Acepta una hora suelta ('8' = la hora completa 08:00-09:00, '08:30' = sólo
+    esa media hora), una lista ('8,9,10', '8 y 9') o un rango ('8-11', '8 a
+    11'). Devuelve [] si no se entiende.
 
-    Los rangos son inclusivos *en bloques*: '8 a 11' son los bloques 8, 9, 10 y
-    11, o sea el quirófano de 08:00 a 12:00. Es ambiguo a propósito de leer,
-    así que quien llama debe mostrarle al médico el horario final resultante.
+    Los rangos son inclusivos *en bloques*: '8 a 11' son las horas 8, 9, 10 y
+    11 completas, o sea el quirófano de 08:00 a 12:00. Es ambiguo a propósito
+    de leer, así que quien llama debe mostrarle al médico el horario final
+    resultante.
     """
     limpio = str(text).strip().lower()
     for sep in [" a ", " al ", " hasta ", "-", "–"]:
@@ -163,8 +193,11 @@ def _parse_horas_texto(text):
             partes = [p for p in limpio.split(sep) if p.strip()]
             if len(partes) != 2:
                 return []
-            ini, fin = _parse_hora_token(partes[0]), _parse_hora_token(partes[1])
-            if ini is None or fin is None or ini > fin:
+            ini_slots, fin_slots = _hora_a_slots(partes[0]), _hora_a_slots(partes[1])
+            if ini_slots is None or fin_slots is None:
+                return []
+            ini, fin = ini_slots[0], fin_slots[-1]
+            if ini > fin:
                 return []
             return list(range(ini, fin + 1))
 
@@ -172,15 +205,15 @@ def _parse_horas_texto(text):
     for token in limpio.replace(";", ",").replace(" y ", ",").split(","):
         if not token.strip():
             continue
-        hora = _parse_hora_token(token)
-        if hora is None:
+        slots = _hora_a_slots(token)
+        if slots is None:
             return []
-        horas.append(hora)
+        horas.extend(slots)
     return sorted(set(horas))
 
 
 def _rango_label(horas):
-    """[4,5,6,7] -> '04:00–08:00' (el bloque 07:00 ocupa hasta las 08:00)."""
+    """[16,17,18,19] -> '08:00–10:00' (el bloque 09:30 ocupa hasta las 10:00)."""
     return f"{_hora_label(horas[0])}–{_hora_label(horas[-1] + 1)}"
 
 
@@ -258,10 +291,11 @@ def _get_session_lock(session_key):
 # mismo sobre status/code/message), para que al quedar operativos los servicios
 # reales el resto del bot no necesite ningún cambio.
 
-# La agenda simulada cubre el día completo (01:00 a 23:00), porque el médico
-# puede encadenar todas las horas seguidas que necesite y no sólo el horario
-# de oficina.
-DEMO_HORAS = [f"{h:02d}:00" for h in range(1, 24)]
+# La agenda simulada cubre el día completo en bloques de 30 minutos (01:00 a
+# 23:30), porque el médico puede encadenar todos los bloques seguidos que
+# necesite y no sólo el horario de oficina. Se usan bloques de 30' y no de
+# hora completa porque así es como LOLCLI entrega los turnos reales.
+DEMO_HORAS = [f"{h:02d}:{m:02d}" for h in range(1, 24) for m in (0, 30)]
 
 # Reservas ya registradas en LOLCLI durante esta ejecución:
 # (quicod, fecha, hora) -> invnum. Permite que un turno recién reservado
@@ -283,12 +317,12 @@ def _demo_slot_ocupado(quicod, fecha, hora):
 
 
 def _demo_slots_cubiertos(horini, horfin):
-    """Bloques horarios (HH:00) que cruza el intervalo [horini, horfin)."""
+    """Bloques de 30' (HH:00/HH:30) que cruza el intervalo [horini, horfin)."""
     slots = []
-    cursor = horini.replace(minute=0, second=0, microsecond=0)
+    cursor = horini.replace(second=0, microsecond=0)
     while cursor < horfin:
-        slots.append((cursor.strftime("%Y-%m-%d"), cursor.strftime("%H:00")))
-        cursor += timedelta(hours=1)
+        slots.append((cursor.strftime("%Y-%m-%d"), cursor.strftime("%H:%M")))
+        cursor += timedelta(minutes=30)
     return slots
 
 
@@ -441,16 +475,25 @@ def send_button_message(phone, body, buttons, instance=None, title="", footer="L
 
 
 def send_list_message(phone, body, sections, instance=None, title="", button_text="Ver opciones", footer=""):
-    """sections = [{"title": "Sec", "rows": [{"id": "r1", "title": "T", "description": "D"}]}]"""
+    """sections = [{"title": "Sec", "rows": [{"id": "r1", "title": "T", "description": "D"}]}]
+
+    Una fila puede traer además un 'number' opcional (sólo lo usa el fallback
+    de texto plano, ver más abajo); no se manda a Evolution para no meterle a
+    la API un campo que no espera.
+    """
     time.sleep(1.2)
     inst = _resolve_instance(instance)
+    api_sections = [
+        {**sec, "rows": [{k: v for k, v in row.items() if k != "number"} for row in sec.get("rows", [])]}
+        for sec in sections
+    ]
     payload = {
         "number": phone,
         "title": title,
         "description": body,
         "buttonText": button_text,
         "footer": footer,
-        "sections": sections,
+        "sections": api_sections,
     }
     try:
         requests.post(
@@ -462,10 +505,20 @@ def send_list_message(phone, body, sections, instance=None, title="", button_tex
     except requests.exceptions.RequestException as e:
         print(f"ERROR send_list_message: {e} — falling back to text")
         lines = []
-        for i, row in enumerate(
-            [r for sec in sections for r in sec.get("rows", [])], 1
-        ):
-            lines.append(f"*{i}.* {row['title']}")
+        counter = 0
+        for row in [r for sec in sections for r in sec.get("rows", [])]:
+            counter += 1
+            # Por defecto el texto numera por posición (1, 2, 3...), que es lo
+            # que 'process_user_choice' espera al leer la respuesta. Algunas
+            # pantallas (como la de horas) necesitan que el número mostrado
+            # coincida con otro valor (la hora real) en vez de la posición, o
+            # que la fila no lleve número porque se responde con una palabra;
+            # para esas, la fila puede traer su propio 'number' (o None).
+            numero = row["number"] if "number" in row else counter
+            if numero is None:
+                lines.append(f"• {row['title']}")
+            else:
+                lines.append(f"*{numero}.* {row['title']}")
         send_whatsapp_message(phone, f"{body}\n\n" + "\n".join(lines), inst)
 
 
@@ -831,10 +884,14 @@ def _handle_message(session_key, phone, message_text, selected_id, config, lolcl
         # texto la etiqueta completa con emoji ("✅ Sí, confirmar"), que no
         # coincide con ninguna palabra suelta: sin mirar el id, la confirmación
         # caía siempre en el 'else' y la reserva nunca se registraba.
+        # Cuando el envío de botones falla, send_button_message reenvía como
+        # texto numerado por posición ("1. ✅ Confirmar", "2. ↩️ Retroceder"),
+        # así que también se acepta "1"/"2": si no, el médico escribe el
+        # número que ve y el flujo se queda trabado sin avanzar.
         choice = selected_id or normalized
-        if choice in ["conf_si", "si", "sí", "confirmar", "confirm"] or "confirmar" in choice:
+        if choice in ["conf_si", "si", "sí", "confirmar", "confirm", "1"] or "confirmar" in choice:
             _confirm_booking(session, phone, lolcli_headers)
-        elif choice in ["conf_no", "no", "retroceder"] or "retroceder" in choice:
+        elif choice in ["conf_no", "no", "retroceder", "2"] or "retroceder" in choice:
             send_whatsapp_message(
                 phone,
                 "↩️ Escribe *'retroceder'* para corregir un paso o *'salir'* para cancelar.",
@@ -1008,8 +1065,8 @@ def _ask_date(session, phone, lolcli_headers):
 def _ask_horas(session, phone, lolcli_headers):
     """Pide los turnos libres del día y arranca la selección de horas.
 
-    Ya no se pregunta por la duración: el médico va sumando horas seguidas y la
-    duración sale de cuántas eligió.
+    Ya no se pregunta por la duración: el médico va sumando bloques de 30
+    minutos seguidos y la duración sale de cuántos eligió.
     """
     fecha_ini = session["fecha_api"]
     fecha_fin = (datetime.strptime(fecha_ini, "%Y-%m-%d") + timedelta(days=1)).strftime("%Y-%m-%d")
@@ -1026,8 +1083,14 @@ def _ask_horas(session, phone, lolcli_headers):
 
     # Se filtra también por fecha exacta, no solo por 'disponible': si el rango
     # [xxfechaini, xxfechafin) resulta inclusivo en el backend, podría devolver
-    # turnos del día siguiente y duplicar horas (p.ej. dos "08:00"), arriesgando
+    # turnos del día siguiente y duplicar bloques (p.ej. dos "08:00"), arriesgando
     # que el médico reserve sin querer el día equivocado.
+    #
+    # LOLCLI trae un registro por cada bloque de 30 minutos (":00" y ":30"), no
+    # uno por hora, así que _parse_hora_token conserva el minuto en vez de
+    # truncarlo: si sólo se guardara la hora, un bloque libre de media hora
+    # bastaría para ofrecer la hora entera como disponible aunque el otro
+    # bloque ya tuviera una cirugía asignada, y la reserva chocaría con ella.
     turnos = [
         t for t in resp_data.get("turnos", [])
         if t.get("disponible") == "S" and str(t.get("fecha", "")).startswith(fecha_ini)
@@ -1051,35 +1114,43 @@ def _ask_horas(session, phone, lolcli_headers):
 def _send_horas_list(session, phone):
     """Muestra la lista de horas según lo que el médico lleve elegido.
 
-    Mientras no haya nada elegido se ofrecen todas las horas libres. En cuanto
-    hay una selección sólo se ofrecen las dos horas pegadas al bloque (la
-    anterior y la siguiente): así el bloque no puede quedar con huecos, que es
-    lo que la base necesita para grabarlo como un único intervalo.
+    Cada opción es un bloque de 30 minutos, igual que en la agenda real.
+    Mientras no haya nada elegido se ofrecen todos los bloques libres. En
+    cuanto hay una selección sólo se ofrecen los dos bloques pegados (el
+    anterior y el siguiente): así el horario no puede quedar con huecos, que
+    es lo que la base necesita para grabarlo como un único intervalo.
     """
     disponibles = session.get("horas_disponibles", [])
     sel = session.get("horas_sel", [])
     rows = []
 
     def add(row_id, title, description=""):
-        rows.append({"id": row_id, "title": title, "description": description})
+        # 'number': None para que, si el mensaje de lista falla y WhatsApp cae
+        # a texto plano, no se numere por posición. En esta pantalla el médico
+        # responde con la hora misma ('8:30' para un bloque, '8' para
+        # encadenar la hora completa) y no con la fila en la lista — un número
+        # de posición ahí le haría reservar un horario distinto del que ve.
+        rows.append({"id": row_id, "title": title, "description": description, "number": None})
 
     if sel:
         add("horas_listo", f"✅ Listo — {_rango_label(sel)}",
-            f"Reservar {format_duration_es(len(sel))} y continuar")
-        for hora in (sel[0] - 1, sel[-1] + 1):
-            if hora in disponibles:
-                add(f"hora_{hora}", f"➕ {_hora_label(hora)}", "Sumar esta hora al bloque")
+            f"Reservar {format_duration_es(len(sel) / 2)} y continuar")
+        for slot in (sel[0] - 1, sel[-1] + 1):
+            if slot in disponibles:
+                add(f"hora_{slot}", f"➕ {_hora_label(slot)}", "Sumar este bloque al horario")
         add("horas_reset", "🔄 Empezar de nuevo", "Borrar las horas elegidas")
         body = (
-            f"Llevas *{_rango_label(sel)}* ({format_duration_es(len(sel))}).\n\n"
-            "Suma otra hora seguida o pulsa *Listo* para continuar."
+            f"Llevas *{_rango_label(sel)}* ({format_duration_es(len(sel) / 2)}).\n\n"
+            "Suma otro bloque escribiendo su hora (por ejemplo *8:30*, o *9* para sumar "
+            "la hora completa), o escribe *listo* para continuar."
         )
     else:
-        for hora in disponibles:
-            add(f"hora_{hora}", _hora_label(hora))
+        for slot in disponibles:
+            add(f"hora_{slot}", _hora_label(slot))
         body = (
             f"Elige la *hora de inicio* en *{session['quidel']}* para *{session['fecha_user']}*.\n\n"
-            "_Puedes encadenar todas las horas seguidas que necesites. "
+            "_Escribe una hora suelta para encadenar la hora completa (por ejemplo *8*), "
+            "o con minutos para un solo bloque de 30 min (por ejemplo *8:30*). "
             "También puedes escribir un rango, por ejemplo *8 a 11*._"
         )
 
@@ -1092,18 +1163,18 @@ def _send_horas_list(session, phone):
 
 
 def _agregar_horas(session, nuevas):
-    """Suma horas a la selección. Devuelve (ok, mensaje_de_error)."""
+    """Suma bloques de 30' a la selección. Devuelve (ok, mensaje_de_error)."""
     disponibles = set(session.get("horas_disponibles", []))
     ocupadas = [h for h in nuevas if h not in disponibles]
     if ocupadas:
         return False, (
-            "Estas horas no están disponibles: "
+            "Estos horarios no están disponibles: "
             + ", ".join(_hora_label(h) for h in sorted(ocupadas))
         )
 
     combinadas = sorted(set(session.get("horas_sel", [])) | set(nuevas))
     if any(b - a != 1 for a, b in zip(combinadas, combinadas[1:])):
-        return False, "Las horas deben ser seguidas, sin saltos entre ellas."
+        return False, "Los bloques deben ser seguidos, sin saltos entre ellos."
 
     session["horas_sel"] = combinadas
     return True, None
@@ -1113,8 +1184,8 @@ def _handle_horas(session, phone, message_text, selected_id, normalized, lolcli_
     """Procesa una respuesta en la pantalla de selección de horas.
 
     Aquí NO se usa _resolve_selection: esa función empareja por número de
-    opción, y en esta pantalla un "8" significa las 08:00, no la octava fila de
-    la lista. Confundirlos reservaría el horario equivocado.
+    opción, y en esta pantalla un "8" significa la hora 08:00 (completa), no
+    la octava fila de la lista. Confundirlos reservaría el horario equivocado.
     """
     if selected_id == "horas_listo" or normalized in ["listo", "ok", "continuar", "terminar", "ya"]:
         _cerrar_seleccion_horas(session, phone, lolcli_headers)
@@ -1154,12 +1225,13 @@ def _cerrar_seleccion_horas(session, phone, lolcli_headers):
         return
 
     horini_dt = datetime.strptime(f"{session['fecha_api']}T{_hora_label(sel[0])}", "%Y-%m-%dT%H:%M")
-    horfin_dt = horini_dt + timedelta(hours=len(sel))
+    # Cada elemento de 'sel' es un bloque de 30 minutos, no una hora.
+    horfin_dt = horini_dt + timedelta(minutes=30 * len(sel))
     session["horini"] = horini_dt.strftime("%Y-%m-%dT%H:%M:%S")
     session["horfin"] = horfin_dt.strftime("%Y-%m-%dT%H:%M:%S")
     session["hora_user"] = horini_dt.strftime("%H:%M")
     session["hora_fin_user"] = _hora_label(sel[-1] + 1)
-    session["duracion_horas"] = len(sel)
+    session["duracion_horas"] = len(sel) / 2
     session.setdefault("history", []).append("AWAITING_HORAS")
     _calcular_precio_y_continuar(session, phone, lolcli_headers)
 
