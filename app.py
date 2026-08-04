@@ -10,7 +10,6 @@ import os
 import threading
 import time
 import unicodedata
-import zlib
 from collections import deque
 from datetime import date, datetime, timedelta
 
@@ -32,16 +31,6 @@ app = Flask(__name__)
 
 EVOLUTION_API_URL = os.getenv("EVOLUTION_API_URL", "").rstrip("/")
 EVOLUTION_API_KEY = os.getenv("EVOLUTION_API_KEY")
-
-# DEMO_MODE=1 simula ÚNICAMENTE los endpoints listados en DEMO_ENDPOINTS, que
-# son los que todavía no están operativos en LOLCLI. Todo lo demás sale del
-# sistema real. Al quedar los dos pendientes operativos, basta con DEMO_MODE=0.
-DEMO_MODE = os.getenv("DEMO_MODE", "0") == "1"
-
-# Estado verificado contra http://15.235.105.124:3011/LolcliApi/api (31/07/2026):
-# los 4 endpoints restantes responden correctamente; sólo el de turnos sigue
-# devolviendo 404 con cualquier nombre probado.
-DEMO_ENDPOINTS = {"listar_turnos"}
 
 CLINICS = {}
 user_sessions = {}
@@ -76,7 +65,10 @@ MONTHS_ES = [
 LOLCLI_ENDPOINTS = {
     "validar_medico": "ValidarMedicoQuirofanoWsp",           # 2.1 — verificado
     "listar_quirofanos": "ListarQuirofanosWsp",              # 2.2 — verificado
-    "listar_turnos": "ListarTurnosDisponiblesWsp",           # 2.3 — POR CONFIRMAR (404)
+    # 2.3 — verificado. El nombre no está en el documento y no sigue el orden
+    # del título ("Listar Turnos Disponibles"): el objeto va en medio, así que
+    # 'ListarTurnosDisponiblesWsp' y variantes devolvían 404.
+    "listar_turnos": "ListarTurnosQuirofanoDisponiblesWsp",  # 2.3 — verificado
     "registrar_separacion": "RegistrarSeparacionQuirofanoWsp",  # 2.4 — verificado
     "calcular_precio": "CalcularPrecioQuirofanoWsp",         # 2.5 — verificado
     # 2.6 — verificado, pero SIN el sufijo 'Wsp': el documento lo nombra
@@ -164,11 +156,12 @@ def _parse_hora_token(token):
 # _parse_posiciones: si se cambia uno hay que cambiar el otro, o el bot estaría
 # prometiendo un formato que después rechaza.
 FORMATO_HORAS = (
-    "⚠️ *Responde SÓLO con números de la lista.*\n\n"
+    "⚠️ *Responde SÓLO con números de un mismo tramo.*\n\n"
     "• Un horario  →  *3*\n"
     "• Varios  →  *3,4,5*\n"
     "• Un rango  →  *3-5*\n\n"
-    "❌ No escribas la hora (*08:00*) ni palabras."
+    "❌ No escribas la hora (*08:00*) ni palabras.\n"
+    "❌ No cruces una línea de _ocupado_."
 )
 
 
@@ -221,6 +214,60 @@ def _parse_posiciones(text, total):
     if any(not 1 <= p <= total for p in posiciones):
         return []
     return posiciones
+
+
+def _turno_disponible(turno):
+    """True si el bloque de 30' está realmente libre.
+
+    'disponible' no llega como el "S"/"N" del documento: el API real devuelve
+    un entero (1 = libre). Se aceptan las dos formas porque el documento y el
+    servidor no coinciden y no se sabe cuál cambiará.
+
+    Además se descarta todo bloque que traiga una intervención asociada
+    (invnum, sepcon o intcod1 con contenido) aunque la bandera diga que está
+    libre. Es a propósito más estricto que la bandera sola: nunca se ha podido
+    observar un bloque ocupado real -- la base de pruebas está vacía -- así que
+    ante la duda es preferible ocultar un horario libre que ofrecer uno que ya
+    tiene cirugía y provocar un cruce al grabar.
+    """
+    marca = turno.get("disponible")
+    if isinstance(marca, str):
+        libre = marca.strip().upper() in ("S", "SI", "SÍ", "1", "TRUE")
+    else:
+        libre = bool(marca)
+    if not libre:
+        return False
+    if turno.get("invnum"):
+        return False
+    return not (str(turno.get("sepcon") or "").strip()
+                or str(turno.get("intcod1") or "").strip())
+
+
+def _tramos_continuos(slots):
+    """Parte los bloques libres en tramos seguidos, sin huecos.
+
+    Recibe los slots ordenados y devuelve [(pos_ini, pos_fin, slot_ini,
+    slot_fin), ...] con posiciones 1-based sobre la lista numerada que ve el
+    médico. Cada corte entre tramos es un turno ya ocupado, que no se lista:
+    por eso dos números seguidos en pantalla pueden no ser dos horarios
+    seguidos, y hay que poder señalarlo.
+    """
+    if not slots:
+        return []
+    tramos = []
+    ini = 0
+    for i in range(1, len(slots) + 1):
+        if i == len(slots) or slots[i] - slots[i - 1] != 1:
+            tramos.append((ini + 1, i, slots[ini], slots[i - 1]))
+            ini = i
+    return tramos
+
+
+def _lista_es(items):
+    """['a'] -> 'a'; ['a','b'] -> 'a y b'; ['a','b','c'] -> 'a, b y c'."""
+    if len(items) <= 1:
+        return "".join(items)
+    return ", ".join(items[:-1]) + " y " + items[-1]
 
 
 def _fmt_hora_iso(valor):
@@ -290,93 +337,6 @@ def _get_session_lock(session_key):
 
 
 # ------------------------------------------------------------------------
-# Modo demo (DEMO_MODE=1)
-# ------------------------------------------------------------------------
-# Sólo cubre los endpoints de DEMO_ENDPOINTS. Las respuestas replican la
-# estructura de "Documentos APIS QUirofanos_V2.docx" (mismos nombres de campo y
-# mismo sobre status/code/message), para que al quedar operativos los servicios
-# reales el resto del bot no necesite ningún cambio.
-
-# La agenda simulada cubre el día completo en bloques de 30 minutos (01:00 a
-# 23:30), porque el médico puede encadenar todos los bloques seguidos que
-# necesite y no sólo el horario de oficina. Se usan bloques de 30' y no de
-# hora completa porque así es como LOLCLI entrega los turnos reales.
-DEMO_HORAS = [f"{h:02d}:{m:02d}" for h in range(1, 24) for m in (0, 30)]
-
-# Reservas ya registradas en LOLCLI durante esta ejecución:
-# (quicod, fecha, hora) -> invnum. Permite que un turno recién reservado
-# aparezca ocupado al volver a listar, pese a que la lista sea simulada.
-_demo_lock = threading.Lock()
-_demo_bookings = {}
-
-
-def _demo_slot_ocupado(quicod, fecha, hora):
-    """Ocupación base determinista (~20%), para que la agenda no salga vacía.
-
-    Los tres valores se mezclan con un CRC32 en vez de sumarse: si el número de
-    hora entrara de forma lineal, las horas ocupadas caerían en un patrón
-    regular (una de cada N) y nunca quedarían bloques largos seguidos que
-    reservar, que es justo lo que el médico necesita poder hacer. Se usa CRC32
-    y no hash() porque hash() de un str cambia en cada arranque del proceso.
-    """
-    return zlib.crc32(f"{quicod}|{fecha}|{hora}".encode()) % 5 == 0
-
-
-def _demo_slots_cubiertos(horini, horfin):
-    """Bloques de 30' (HH:00/HH:30) que cruza el intervalo [horini, horfin)."""
-    slots = []
-    cursor = horini.replace(second=0, microsecond=0)
-    while cursor < horfin:
-        slots.append((cursor.strftime("%Y-%m-%d"), cursor.strftime("%H:%M")))
-        cursor += timedelta(minutes=30)
-    return slots
-
-
-def _demo_error(code, message, container, empty):
-    return {"status": "error", "code": code, "message": message, container: empty}
-
-
-def _demo_response(endpoint_key, payload):
-    if endpoint_key == "listar_turnos":
-        quicod = payload.get("xxquicod", "")
-        fecha = str(payload.get("xxfechaini", ""))
-        turnos = []
-        with _demo_lock:
-            for hora in DEMO_HORAS:
-                invnum = _demo_bookings.get((quicod, fecha, hora))
-                ocupado = invnum is not None or _demo_slot_ocupado(quicod, fecha, hora)
-                turnos.append({
-                    "fecha": f"{fecha}T00:00:00.000Z",
-                    "hora": hora,
-                    "intcod1": f"INT-{invnum}" if invnum else "",
-                    "medcod": "",
-                    "sepcon": "OCUPADO" if ocupado else "",
-                    "invnum": invnum or 0,
-                    "disponible": "N" if ocupado else "S",
-                })
-        return {"status": "success", "code": 200, "message": "OK", "turnos": turnos}
-
-    return _demo_error(500, "Error al obtener los registros", "data", [])
-
-
-def _demo_marcar_reservado(payload, invnum):
-    """Refleja en la agenda simulada una separación que sí se grabó en LOLCLI.
-
-    Las reservas son reales, pero la lista de turnos todavía se simula. Sin
-    esto, un turno recién reservado seguiría apareciendo libre al volver atrás.
-    """
-    try:
-        ini = datetime.strptime(payload["xxhorini"], "%Y-%m-%dT%H:%M:%S")
-        fin = datetime.strptime(payload["xxhorfin"], "%Y-%m-%dT%H:%M:%S")
-    except (KeyError, ValueError):
-        return
-    quicod = payload.get("xxquicod", "")
-    with _demo_lock:
-        for fecha, hora in _demo_slots_cubiertos(ini, fin):
-            _demo_bookings[(quicod, fecha, hora)] = invnum
-
-
-# ------------------------------------------------------------------------
 # LOLCLI API client
 # ------------------------------------------------------------------------
 
@@ -390,13 +350,6 @@ def _call_lolcli(endpoint_key, payload, headers, timeout=8):
     Retorna (data, error_message). error_message es None si status == "success".
     """
     endpoint = LOLCLI_ENDPOINTS[endpoint_key]
-
-    if DEMO_MODE and endpoint_key in DEMO_ENDPOINTS:
-        data = _demo_response(endpoint_key, payload)
-        print(f"DEMO {endpoint}: payload={payload} -> {data.get('status')} ({data.get('message')})")
-        if data.get("status") == "error":
-            return data, data.get("message", "Ocurrió un error inesperado.")
-        return data, None
 
     url = f"{g.lolcli_url}/{endpoint}"
     try:
@@ -1094,11 +1047,13 @@ def _ask_horas(session, phone, lolcli_headers):
     minutos seguidos y la duración sale de cuántos eligió.
     """
     fecha_ini = session["fecha_api"]
-    fecha_fin = (datetime.strptime(fecha_ini, "%Y-%m-%d") + timedelta(days=1)).strftime("%Y-%m-%d")
+    # El rango es inclusivo en los dos extremos: pedir [día, día] devuelve las
+    # 48 medias horas de ese día. Antes se pedía hasta el día siguiente, que
+    # traía 96 filas para quedarse con la mitad.
     payload = {
         "xxsiscod": g.default_siscod,
         "xxfechaini": fecha_ini,
-        "xxfechafin": fecha_fin,
+        "xxfechafin": fecha_ini,
         "xxquicod": session["quicod"],
     }
     resp_data, err = _call_lolcli("listar_turnos", payload, lolcli_headers)
@@ -1106,10 +1061,10 @@ def _ask_horas(session, phone, lolcli_headers):
         send_whatsapp_message(phone, f"❌ {err}")
         return
 
-    # Se filtra también por fecha exacta, no solo por 'disponible': si el rango
-    # [xxfechaini, xxfechafin) resulta inclusivo en el backend, podría devolver
-    # turnos del día siguiente y duplicar bloques (p.ej. dos "08:00"), arriesgando
-    # que el médico reserve sin querer el día equivocado.
+    # Se filtra también por fecha exacta, no sólo por disponibilidad: el rango
+    # es inclusivo, así que un xxfechafin distinto devolvería turnos de otro día
+    # y duplicaría bloques (p.ej. dos "08:00"), arriesgando que el médico
+    # reserve sin querer el día equivocado.
     #
     # LOLCLI trae un registro por cada bloque de 30 minutos (":00" y ":30"), no
     # uno por hora, así que _parse_hora_token conserva el minuto en vez de
@@ -1118,7 +1073,7 @@ def _ask_horas(session, phone, lolcli_headers):
     # bloque ya tuviera una cirugía asignada, y la reserva chocaría con ella.
     turnos = [
         t for t in resp_data.get("turnos", [])
-        if t.get("disponible") == "S" and str(t.get("fecha", "")).startswith(fecha_ini)
+        if _turno_disponible(t) and str(t.get("fecha", "")).startswith(fecha_ini)
     ]
     horas = sorted({
         h for h in (_parse_hora_token(t.get("hora", "")) for t in turnos) if h is not None
@@ -1154,16 +1109,78 @@ def _send_horas_numeradas(session, phone):
     _handle_horas.
     """
     opciones = session.get("options", [])
-    lineas = "\n".join(f"*{o['id']}.* {o['data']['label']}" for o in opciones)
+    lineas = []
+    anterior = None
+    for o in opciones:
+        slot = o["data"]["slot"]
+        if anterior is not None and slot - anterior != 1:
+            # Entre este bloque y el anterior hay turnos ya tomados, que no se
+            # listan. Sin marcar el corte, dos números seguidos en pantalla
+            # parecen encadenables y no lo son: es lo que hacía que un '6,7,8'
+            # perfectamente razonable saliera rechazado.
+            faltantes = list(range(anterior + 1, slot))
+            if len(faltantes) <= 2:
+                ocupado = _lista_es([_hora_label(s) for s in faltantes])
+            else:
+                ocupado = f"{_hora_label(faltantes[0])} a {_hora_label(faltantes[-1] + 1)}"
+            lineas.append(f"───── ocupado: {ocupado} ─────")
+        lineas.append(f"*{o['id']}.* {o['data']['label']}")
+        anterior = slot
+
     send_whatsapp_message(
         phone,
         f"🕐 *Horarios disponibles*\n"
         f"🏥 {session.get('quidel', '')}\n"
         f"🗓️ {session.get('fecha_user', '')}\n\n"
-        f"{lineas}\n\n"
-        f"━━━━━━━━━━━━━━━━━━━━\n"
-        f"{FORMATO_HORAS}",
+        + "\n".join(lineas)
+        + f"\n\n━━━━━━━━━━━━━━━━━━━━\n{FORMATO_HORAS}",
     )
+
+
+def _mensaje_no_seguidos(opciones, posiciones, slots):
+    """Explica el rechazo y ofrece tramos que sí se pueden reservar.
+
+    Rechazar y nada más deja al médico buscando a mano una combinación válida
+    sobre una lista de casi 40 líneas, así que además se le dice hasta dónde
+    llega el tramo donde empezó y cuáles son los tramos largos del día.
+    """
+    ocupados = [
+        _hora_label(s) for a, b in zip(slots, slots[1:]) for s in range(a + 1, b)
+    ]
+    partes = [
+        "⚠️ Elegiste " + _lista_es([_hora_label(s) for s in slots])
+        + " y no son seguidos: " + _lista_es(ocupados)
+        + (" ya está ocupado." if len(ocupados) == 1 else " ya están ocupados.")
+    ]
+
+    tramos = _tramos_continuos([o["data"]["slot"] for o in opciones])
+    primera = posiciones[0]
+    for pos_ini, pos_fin, _slot_ini, slot_fin in tramos:
+        if pos_ini <= primera <= pos_fin:
+            if pos_fin > primera:
+                partes.append(
+                    f"\nDesde el *{primera}* puedes seguir hasta el *{pos_fin}* "
+                    f"({_hora_label(slots[0])} a {_hora_label(slot_fin + 1)})."
+                )
+            else:
+                partes.append(
+                    f"\nDesde el *{primera}* el tramo termina ahí mismo "
+                    f"({_hora_label(slots[0])} a {_hora_label(slots[0] + 1)})."
+                )
+            break
+
+    # Los más largos primero, pero se muestran en el orden del día para que
+    # sea fácil ubicarlos en la lista.
+    largos = sorted(tramos, key=lambda t: t[1] - t[0], reverse=True)[:3]
+    if largos:
+        partes.append("\n*Tramos seguidos más largos de hoy:*")
+        for pos_ini, pos_fin, slot_ini, slot_fin in sorted(largos):
+            numeros = f"*{pos_ini}*" if pos_ini == pos_fin else f"*{pos_ini}-{pos_fin}*"
+            partes.append(
+                f"  {numeros}  →  {_hora_label(slot_ini)} a {_hora_label(slot_fin + 1)}"
+                f"  ({format_duration_es((pos_fin - pos_ini + 1) / 2)})"
+            )
+    return "\n".join(partes)
 
 
 def _handle_horas(session, phone, message_text, selected_id, lolcli_headers):
@@ -1191,17 +1208,7 @@ def _handle_horas(session, phone, message_text, selected_id, lolcli_headers):
 
     slots = [opciones[p - 1]["data"]["slot"] for p in posiciones]
     if any(b - a != 1 for a, b in zip(slots, slots[1:])):
-        # Las posiciones sí son seguidas, pero los horarios detrás no: entre
-        # medio hay un turno ocupado que no aparece en la lista. Se nombran los
-        # horarios elegidos porque, mirando sólo los números, el médico no
-        # tiene cómo saber por qué se le rechaza una selección consecutiva.
-        send_whatsapp_message(
-            phone,
-            "⚠️ Elegiste "
-            + ", ".join(_hora_label(s) for s in slots)
-            + ", y no son horarios seguidos.\n\n"
-            "La reserva tiene que ser un solo bloque continuo, sin huecos.",
-        )
+        send_whatsapp_message(phone, _mensaje_no_seguidos(opciones, posiciones, slots))
         _send_horas_numeradas(session, phone)
         return
 
@@ -1370,8 +1377,6 @@ def _confirm_booking(session, phone, lolcli_headers):
 
     invnum = resp_data.get("invnum", "—")
     session["invnum"] = invnum
-    if DEMO_MODE and "listar_turnos" in DEMO_ENDPOINTS:
-        _demo_marcar_reservado(payload, invnum)
     send_whatsapp_message(
         phone,
         f"✅ *¡Reserva registrada!*\n\n"
@@ -1467,9 +1472,6 @@ def _replay_state(state, session, phone, lolcli_headers):
 # ---------------------------------------------------------------------------
 
 load_clinics()
-if DEMO_MODE:
-    print(f"INFO: DEMO_MODE activo -- simulando sólo: {', '.join(sorted(DEMO_ENDPOINTS))}.")
-    print("INFO: el resto (validar médico, listar quirófanos, calcular precio) usa el API real.")
 threading.Thread(target=session_cleanup_task, daemon=True).start()
 
 if __name__ == "__main__":
