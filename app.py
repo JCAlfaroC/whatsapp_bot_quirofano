@@ -1,12 +1,8 @@
 # --- app.py ( Chatbot-Quirofanos para Medicos: Version 0.0.1) ---
 
-# from doctest import NORMALIZE_WHITESPACE
 import json
 import locale
 import os
-#import re
-
-# from smtplib import SMTP_PORT
 import threading
 import time
 import unicodedata
@@ -18,6 +14,10 @@ from dotenv import load_dotenv
 from flask import Flask, g, jsonify, request
 from thefuzz import process
 
+# Las fechas que ve el médico no dependen de esto: format_date_es las arma con
+# DAYS_ES/MONTHS_ES para que salgan igual en cualquier servidor. El locale sólo
+# afecta a strftime, así que si el sistema no lo tiene instalado se avisa y se
+# sigue: no es motivo para no arrancar.
 try:
     locale.setlocale(locale.LC_TIME, "es_ES.UTF-8")
 except (locale.Error, Exception):
@@ -50,6 +50,11 @@ _processed_msg_ids_order = deque()
 _session_locks_meta_lock = threading.Lock()
 _session_locks = {}
 
+# Tiempos de la sesión, en segundos. A los 5 minutos sin respuesta se manda un
+# recordatorio y a los 15 se cierra la sesión: una reserva a medias no puede
+# quedar viva indefinidamente ocupando memoria ni reanudarse al día siguiente
+# con una agenda que ya cambió. Los revisa session_cleanup_task una vez por
+# minuto, así que el cierre real puede demorar hasta 60 s más.
 INACTIVITY_REMINDER_PERIOD = 5 * 60
 SESSION_EXPIRATION_PERIOD = 15 * 60
 
@@ -106,6 +111,9 @@ TIPOS_DOCUMENTO = [
 # ------------------------------------------------------------------------
 
 def normalize_text(text):
+    """Deja el texto comparable: sin mayúsculas, tildes, puntuación ni espacios
+    de más ('¿Sábado?' -> 'sabado'). Se usa para reconocer lo que escribe el
+    médico, que rara vez viene acentuado desde el teclado del teléfono."""
     text = text.lower()
     text = "".join(
         c for c in unicodedata.normalize("NFD", text) if unicodedata.category(c) != "Mn"
@@ -119,6 +127,12 @@ def format_date_es(date_obj):
 
 
 def format_duration_es(hours):
+    """1 -> '1 hora'; 1.5 -> '1,5 horas'; 2 -> '2 horas'.
+
+    Con bloques de 30 minutos la duración puede caer en media hora, así que se
+    usa ':g' (que no deja el '.0' de las duraciones enteras) y coma decimal, que
+    es como se escribe en Perú.
+    """
     label = f"{hours:g}".replace(".", ",")
     return f"{label} hora" + ("s" if hours != 1 else "")
 
@@ -306,16 +320,31 @@ def _fmt_fecha_iso(valor):
 
 
 def next_business_days(n=14):
+    """Las próximas n fechas que se le ofrecen al médico.
+
+    Empiezan mañana: el día de hoy no se ofrece, porque a esta altura del día
+    la agenda ya está en curso. Se excluye sólo el domingo, así que el sábado
+    sí aparece en la lista.
+    """
     days = []
     current = date.today() + timedelta(days=1)
     while len(days) < n:
-        if current.weekday() < 6:  # Mon–Sat
+        if current.weekday() < 6:  # lunes a sábado
             days.append(current)
         current += timedelta(days=1)
     return days
 
 
 def load_clinics():
+    """Carga la configuración por clínica (URL de LOLCLI, token, instancia de
+    Evolution, teléfono de soporte).
+
+    La ruta es relativa, así que el proceso tiene que arrancar desde la carpeta
+    del proyecto. Un fallo aquí no detiene el arranque a propósito: el servidor
+    igual levanta y responde /test, y el webhook devuelve 404 por clínica
+    desconocida, que es un síntoma mucho más fácil de diagnosticar que un
+    proceso que no arranca.
+    """
     global CLINICS
     try:
         with open("clinics.json", "r", encoding="utf-8") as f:
@@ -344,6 +373,12 @@ def _mark_processed_if_new(msg_id):
 
 
 def _get_session_lock(session_key):
+    """Lock de esta conversación, creándolo la primera vez.
+
+    El lock no se borra al cerrarse la sesión: un mensaje que llega justo
+    mientras la sesión expira tiene que encontrar el mismo lock que el hilo de
+    limpieza, y son unos pocos bytes por número atendido.
+    """
     with _session_locks_meta_lock:
         lock = _session_locks.get(session_key)
         if lock is None:
@@ -422,6 +457,9 @@ def _log_evolution_error(label, e):
 
 
 def send_whatsapp_message(phone, text, instance=None):
+    # La pausa antes de cada envío es a propósito: varios mensajes seguidos y
+    # sin espera (el bot manda de a dos o tres por paso) llegan desordenados al
+    # teléfono y WhatsApp puede marcarlos como envío masivo.
     time.sleep(1.2)
     inst = _resolve_instance(instance)
     try:
@@ -521,6 +559,14 @@ def send_list_message(phone, body, sections, instance=None, title="", button_tex
 # ---------------------------------------------------------------------------
 
 def process_user_choice(user_input, options, key_name=None):
+    """Traduce lo que respondió el médico a una de las opciones que se le
+    mostraron.
+
+    El camino normal es el número de la lista, que es lo único que se le pide en
+    pantalla. 'key_name' habilita además reconocer la opción por su nombre
+    escrito (exacto o aproximado, con un mínimo de parecido para no adivinar mal
+    por él); las pantallas que no lo pasan aceptan sólo el número.
+    """
     try:
         idx = int(user_input) - 1
         if 0 <= idx < len(options):
@@ -567,6 +613,12 @@ def show_main_menu(phone, session, instance=None):
 # ---------------------------------------------------------------------------
 
 def session_cleanup_task():
+    """Hilo de fondo que avisa y cierra las sesiones abandonadas.
+
+    Se recorre una copia de las claves porque los hilos que atienden el webhook
+    agregan y quitan sesiones al mismo tiempo, y recorrer el diccionario en vivo
+    reventaría el hilo (y con él la limpieza) en cuanto llegara un mensaje.
+    """
     while True:
         time.sleep(60)
         now = time.time()
@@ -671,6 +723,10 @@ def webhook_handler(clinic_id):
         msg = data["data"]["message"]
         msg_id = key.get("id")
     except (KeyError, TypeError):
+        # Evolution manda por el mismo webhook eventos que no son mensajes de
+        # chat (acuses de entrega, cambios de conexión, ediciones). Se responde
+        # 200 y no un error: un código de error haría que Evolution reintentara
+        # el mismo evento una y otra vez.
         return jsonify({"status": "ignored_format"}), 200
 
     if not sender:
@@ -763,6 +819,10 @@ def _handle_message(session_key, phone, message_text, selected_id, config, lolcl
         return jsonify({"status": "reverted"})
 
     # --- State machine ---
+    # Cada estado que pueda quedar guardado en la sesión tiene que tener su rama
+    # aquí y su equivalente en _replay_state (que es el que lo vuelve a
+    # preguntar al 'retroceder'). Un estado sin rama no responde nada y deja al
+    # médico esperando, así que al agregar un paso hay que tocar los dos.
     state = session.get("state", "START")
 
     if state == "START":
@@ -919,7 +979,12 @@ def _handle_message(session_key, phone, message_text, selected_id, config, lolcl
 # ---------------------------------------------------------------------------
 
 def _resolve_selection(message_text, selected_id, session):
-    """Match a button/list ID or text number against session options."""
+    """Resuelve la opción elegida, venga de un tap en la lista interactiva
+    (selected_id) o del número que escribió el médico.
+
+    Se prueba primero el id porque es exacto; el número se resuelve por posición
+    sobre las mismas 'options' que se acaban de mostrar.
+    """
     options = session.get("options", [])
     if selected_id:
         for opt in options:
@@ -1378,6 +1443,9 @@ def _confirm_booking(session, phone, lolcli_headers):
     if _iniciar_pago(session, phone):
         return
 
+    # 'xxsepdat' es la fecha en que se registra la reserva (ahora), distinta de
+    # 'xxhorini'/'xxhorfin', que son las de la intervención y ya vienen armadas
+    # desde la selección de horarios.
     payload = {
         "xxsiscod": g.default_siscod,
         "xxquicod": session["quicod"],
@@ -1386,6 +1454,9 @@ def _confirm_booking(session, phone, lolcli_headers):
         "xxhorfin": session["horfin"],
         "xxmedcod": session["medcod"],
     }
+    # Timeout más holgado que el resto de llamadas: ésta es la que escribe en la
+    # base y valida cruces, así que tarda más, y cortarla antes de tiempo dejaría
+    # la duda de si la reserva quedó grabada o no.
     resp_data, err = _call_lolcli("registrar_separacion", payload, lolcli_headers, timeout=10)
     if err:
         # Un cruce de horarios no es un fallo del que el médico pueda salir
@@ -1499,6 +1570,13 @@ def _trigger_human_handoff(session, phone, config, lolcli_headers):
 
 
 def _replay_state(state, session, phone, lolcli_headers):
+    """Vuelve a hacer la pregunta de un paso anterior, al 'retroceder'.
+
+    Se rearman las opciones consultando de nuevo al API en vez de reusar las que
+    quedaron en la sesión: entre medio pudo tomarse un horario, y volver atrás
+    tiene que mostrar la agenda como está ahora. Si el paso no está contemplado
+    se devuelve al menú, para no dejar la conversación sin salida.
+    """
     if state == "AWAITING_TIDCOD":
         _ask_tipo_documento(session, phone)
     elif state == "AWAITING_MEDDOC":
